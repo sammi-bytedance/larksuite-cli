@@ -1,0 +1,901 @@
+// Copyright (c) 2026 Lark Technologies Pte. Ltd.
+// SPDX-License-Identifier: MIT
+
+package mail
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+
+	"github.com/larksuite/cli/internal/cmdutil"
+	"github.com/larksuite/cli/shortcuts/common"
+	"github.com/larksuite/cli/shortcuts/mail/emlbuilder"
+)
+
+func TestDecodeBodyFields(t *testing.T) {
+	htmlEncoded := base64.URLEncoding.EncodeToString([]byte("<p>Hello</p>"))
+	plainEncoded := base64.RawURLEncoding.EncodeToString([]byte("Hello plain"))
+
+	src := map[string]interface{}{
+		"body_html":       htmlEncoded,
+		"body_plain_text": plainEncoded,
+		"subject":         "untouched",
+	}
+	dst := map[string]interface{}{}
+	decodeBodyFields(src, dst)
+
+	if dst["body_html"] != "<p>Hello</p>" {
+		t.Fatalf("body_html not decoded: %#v", dst["body_html"])
+	}
+	if dst["body_plain_text"] != "Hello plain" {
+		t.Fatalf("body_plain_text not decoded: %#v", dst["body_plain_text"])
+	}
+	if _, ok := dst["subject"]; ok {
+		t.Fatalf("subject should not be copied by decodeBodyFields")
+	}
+	// src must not be modified
+	if src["body_html"] != htmlEncoded {
+		t.Fatalf("src was mutated")
+	}
+}
+
+func TestDecodeBodyFieldsSkipsAbsent(t *testing.T) {
+	src := map[string]interface{}{"subject": "no body"}
+	dst := map[string]interface{}{}
+	decodeBodyFields(src, dst)
+	if len(dst) != 0 {
+		t.Fatalf("expected empty dst, got %#v", dst)
+	}
+}
+
+func TestMessageFieldPolicy(t *testing.T) {
+	if !shouldExposeRawMessageField("custom_meta") {
+		t.Fatalf("custom metadata should be auto-passed through")
+	}
+	if shouldExposeRawMessageField("body_plain_text") {
+		t.Fatalf("body_* fields should not be auto-passed through")
+	}
+	if !shouldExposeRawMessageField("head_from") {
+		t.Fatalf("head_from should be auto-passed through")
+	}
+	if shouldExposeRawMessageField("attachments") {
+		t.Fatalf("attachments should be derived, not auto-passed through")
+	}
+	if len(derivedMessageFields) == 0 {
+		t.Fatalf("derivedMessageFields should document derived output fields")
+	}
+}
+
+func TestToForwardSourceAttachments(t *testing.T) {
+	out := normalizedMessageForCompose{
+		Attachments: []mailAttachmentOutput{
+			{
+				ID:          "att1",
+				Filename:    "report.pdf",
+				ContentType: "application/pdf",
+				DownloadURL: "https://example.com/att1",
+			},
+		},
+	}
+
+	atts := toForwardSourceAttachments(out)
+	if len(atts) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(atts))
+	}
+	if atts[0].Filename != "report.pdf" {
+		t.Fatalf("unexpected filename: %s", atts[0].Filename)
+	}
+	if atts[0].DownloadURL == "" {
+		t.Fatalf("expected download_url to be set")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseInlineSpecs
+// ---------------------------------------------------------------------------
+
+func TestParseInlineSpecs_Empty(t *testing.T) {
+	specs, err := parseInlineSpecs("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(specs) != 0 {
+		t.Fatalf("expected empty slice, got %v", specs)
+	}
+}
+
+func TestParseInlineSpecs_Whitespace(t *testing.T) {
+	specs, err := parseInlineSpecs("   ")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(specs) != 0 {
+		t.Fatalf("expected empty slice for whitespace input, got %v", specs)
+	}
+}
+
+func TestParseInlineSpecs_Valid(t *testing.T) {
+	raw := `[{"cid":"YmFubmVyLnBuZw","file_path":"./banner.png"},{"cid":"bG9nby5wbmc","file_path":"/abs/logo.png"}]`
+	specs, err := parseInlineSpecs(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("expected 2 specs, got %d", len(specs))
+	}
+	if specs[0].CID != "YmFubmVyLnBuZw" {
+		t.Errorf("specs[0].CID = %q, want YmFubmVyLnBuZw", specs[0].CID)
+	}
+	if specs[0].FilePath != "./banner.png" {
+		t.Errorf("specs[0].FilePath = %q, want ./banner.png", specs[0].FilePath)
+	}
+	if specs[1].CID != "bG9nby5wbmc" {
+		t.Errorf("specs[1].CID = %q, want bG9nby5wbmc", specs[1].CID)
+	}
+	if specs[1].FilePath != "/abs/logo.png" {
+		t.Errorf("specs[1].FilePath = %q, want /abs/logo.png", specs[1].FilePath)
+	}
+}
+
+func TestParseInlineSpecs_InvalidJSON(t *testing.T) {
+	_, err := parseInlineSpecs(`not-json`)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
+}
+
+func TestParseInlineSpecs_MissingCID(t *testing.T) {
+	_, err := parseInlineSpecs(`[{"cid":"","file_path":"./banner.png"}]`)
+	if err == nil {
+		t.Fatal("expected error for empty cid, got nil")
+	}
+}
+
+func TestParseInlineSpecs_MissingFilePath(t *testing.T) {
+	_, err := parseInlineSpecs(`[{"cid":"YmFubmVyLnBuZw","file_path":""}]`)
+	if err == nil {
+		t.Fatal("expected error for empty file_path, got nil")
+	}
+}
+
+func TestParseInlineSpecs_OldKeyRejected(t *testing.T) {
+	// "file-path" (kebab) must not be recognised — only "file_path" (snake) is valid.
+	// The JSON decoder will silently ignore unknown keys, so file_path stays empty → validation error.
+	_, err := parseInlineSpecs(`[{"cid":"YmFubmVyLnBuZw","file-path":"./banner.png"}]`)
+	if err == nil {
+		t.Fatal("expected error when using old kebab-case key \"file-path\", got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// inlineSpecFilePaths
+// ---------------------------------------------------------------------------
+
+func TestInlineSpecFilePaths(t *testing.T) {
+	specs := []InlineSpec{
+		{CID: "cid1", FilePath: "./a.png"},
+		{CID: "cid2", FilePath: "/b.jpg"},
+	}
+	paths := inlineSpecFilePaths(specs)
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 paths, got %d", len(paths))
+	}
+	if paths[0] != "./a.png" {
+		t.Errorf("paths[0] = %q, want ./a.png", paths[0])
+	}
+	if paths[1] != "/b.jpg" {
+		t.Errorf("paths[1] = %q, want /b.jpg", paths[1])
+	}
+}
+
+func TestInlineSpecFilePaths_Nil(t *testing.T) {
+	if paths := inlineSpecFilePaths(nil); paths != nil {
+		t.Fatalf("expected nil for nil input, got %v", paths)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// validateForwardAttachmentURLs / validateInlineImageURLs
+// ---------------------------------------------------------------------------
+
+func TestValidateForwardAttachmentURLs_MissingDownloadURL(t *testing.T) {
+	src := composeSourceMessage{
+		ForwardAttachments: []forwardSourceAttachment{
+			{ID: "att1", Filename: "report.pdf", DownloadURL: "https://example.com/att1"},
+			{ID: "att2", Filename: "budget.xlsx", DownloadURL: ""}, // missing
+		},
+	}
+	err := validateForwardAttachmentURLs(src)
+	if err == nil {
+		t.Fatal("expected error when attachment download URL is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "budget.xlsx") {
+		t.Errorf("error should mention missing attachment filename, got: %v", err)
+	}
+}
+
+func TestValidateForwardAttachmentURLs_IgnoresInlineImages(t *testing.T) {
+	src := composeSourceMessage{
+		ForwardAttachments: []forwardSourceAttachment{
+			{ID: "att1", Filename: "report.pdf", DownloadURL: "https://example.com/att1"},
+		},
+		InlineImages: []inlineSourcePart{
+			{ID: "img1", Filename: "logo.png", CID: "cid1", DownloadURL: ""}, // missing but should NOT cause error
+		},
+	}
+	if err := validateForwardAttachmentURLs(src); err != nil {
+		t.Fatalf("inline image missing URL should not affect forward attachment validation: %v", err)
+	}
+}
+
+func TestValidateForwardAttachmentURLs_AllPresent(t *testing.T) {
+	src := composeSourceMessage{
+		ForwardAttachments: []forwardSourceAttachment{
+			{ID: "att1", Filename: "report.pdf", DownloadURL: "https://example.com/att1"},
+		},
+		InlineImages: []inlineSourcePart{
+			{ID: "img1", Filename: "logo.png", CID: "cid1", DownloadURL: "https://example.com/img1"},
+		},
+	}
+	if err := validateForwardAttachmentURLs(src); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateInlineImageURLs_MissingDownloadURL(t *testing.T) {
+	src := composeSourceMessage{
+		ForwardAttachments: []forwardSourceAttachment{
+			{ID: "att1", Filename: "report.pdf", DownloadURL: ""}, // missing but should NOT cause error
+		},
+		InlineImages: []inlineSourcePart{
+			{ID: "img1", Filename: "banner.png", CID: "cid1", DownloadURL: ""}, // missing
+		},
+	}
+	err := validateInlineImageURLs(src)
+	if err == nil {
+		t.Fatal("expected error when inline image download URL is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "banner.png") {
+		t.Errorf("error should mention missing inline image filename, got: %v", err)
+	}
+}
+
+func TestValidateInlineImageURLs_IgnoresAttachments(t *testing.T) {
+	// Inline images are fine; attachments have missing URLs but should NOT be checked.
+	src := composeSourceMessage{
+		ForwardAttachments: []forwardSourceAttachment{
+			{ID: "att1", Filename: "report.pdf", DownloadURL: ""}, // missing — irrelevant for this check
+		},
+		InlineImages: []inlineSourcePart{
+			{ID: "img1", Filename: "logo.png", CID: "cid1", DownloadURL: "https://example.com/img1"},
+		},
+	}
+	if err := validateInlineImageURLs(src); err != nil {
+		t.Fatalf("unexpected error — attachment missing URL should not affect inline-only validation: %v", err)
+	}
+}
+
+func TestToForwardSourceAttachments_PreservesMissingURL(t *testing.T) {
+	out := normalizedMessageForCompose{
+		Attachments: []mailAttachmentOutput{
+			{ID: "att1", Filename: "ok.pdf", DownloadURL: "https://example.com/ok"},
+			{ID: "att2", Filename: "broken.pdf", DownloadURL: ""},
+		},
+	}
+	atts := toForwardSourceAttachments(out)
+	if len(atts) != 2 {
+		t.Fatalf("expected 2 attachments (including missing URL), got %d", len(atts))
+	}
+}
+
+func TestToInlineSourceParts_PreservesMissingURL(t *testing.T) {
+	out := normalizedMessageForCompose{
+		Images: []mailImageOutput{
+			{ID: "img1", Filename: "ok.png", CID: "cid1", DownloadURL: "https://example.com/ok"},
+			{ID: "img2", Filename: "broken.png", CID: "cid2", DownloadURL: ""},
+		},
+	}
+	parts := toInlineSourceParts(out)
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 inline parts (including missing URL), got %d", len(parts))
+	}
+}
+
+// --- downloadAttachmentContent security tests ---
+
+// newDownloadRuntime builds a minimal RuntimeContext that uses the given
+// *http.Client for outbound requests.
+func newDownloadRuntime(t *testing.T, client *http.Client) *common.RuntimeContext {
+	t.Helper()
+	f := &cmdutil.Factory{
+		HttpClient: func() (*http.Client, error) { return client, nil },
+	}
+	rt := common.TestNewRuntimeContextWithCtx(context.Background(), &cobra.Command{}, nil)
+	rt.Factory = f
+	return rt
+}
+
+func TestDownloadAttachmentContent_RejectsHTTP(t *testing.T) {
+	rt := newDownloadRuntime(t, &http.Client{})
+	_, err := downloadAttachmentContent(rt, "http://evil.example.com/file")
+	if err == nil || !strings.Contains(err.Error(), "https") {
+		t.Errorf("expected https-required error, got: %v", err)
+	}
+}
+
+func TestDownloadAttachmentContent_RejectsFileScheme(t *testing.T) {
+	rt := newDownloadRuntime(t, &http.Client{})
+	_, err := downloadAttachmentContent(rt, "file:///etc/passwd")
+	if err == nil || !strings.Contains(err.Error(), "https") {
+		t.Errorf("expected https-required error, got: %v", err)
+	}
+}
+
+func TestDownloadAttachmentContent_RejectsEmptyHost(t *testing.T) {
+	rt := newDownloadRuntime(t, &http.Client{})
+	_, err := downloadAttachmentContent(rt, "https:///no-host")
+	if err == nil || !strings.Contains(err.Error(), "host") {
+		t.Errorf("expected no-host error, got: %v", err)
+	}
+}
+
+func TestDownloadAttachmentContent_NoAuthorizationHeader(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			http.Error(w, "unexpected Authorization header", http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, "attachment data")
+	}))
+	defer srv.Close()
+
+	rt := newDownloadRuntime(t, srv.Client())
+	data, err := downloadAttachmentContent(rt, srv.URL+"/file?code=presigned")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(data) != "attachment data" {
+		t.Errorf("unexpected content: %q", data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// newOutputRuntime — helper for tests that call runtime.Out / runtime.IO()
+// ---------------------------------------------------------------------------
+
+func newOutputRuntime(t *testing.T) (*common.RuntimeContext, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	f := &cmdutil.Factory{
+		IOStreams: &cmdutil.IOStreams{Out: stdout, ErrOut: stderr},
+	}
+	rt := common.TestNewRuntimeContext(&cobra.Command{}, nil)
+	rt.Factory = f
+	return rt, stdout, stderr
+}
+
+// ---------------------------------------------------------------------------
+// printMessageOutputSchema
+// ---------------------------------------------------------------------------
+
+func TestPrintMessageOutputSchema(t *testing.T) {
+	rt, stdout, _ := newOutputRuntime(t)
+	printMessageOutputSchema(rt)
+	out := stdout.String()
+	// Verify key fields from the schema are present
+	for _, key := range []string{
+		"body_plain_text", "body_html", "attachments", "head_from",
+		"bcc", "date", "smtp_message_id", "in_reply_to", "references",
+		"internal_date", "message_state", "message_state_text",
+		"folder_id", "label_ids", "priority_type", "priority_type_text",
+		"security_level", "draft_id", "reply_to", "reply_to_smtp_message_id",
+		"body_preview", "thread_id", "message_count",
+		"date_formatted",
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("printMessageOutputSchema output missing key %q", key)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// printWatchOutputSchema
+// ---------------------------------------------------------------------------
+
+func TestPrintWatchOutputSchema(t *testing.T) {
+	rt, stdout, _ := newOutputRuntime(t)
+	printWatchOutputSchema(rt)
+	out := stdout.String()
+	for _, key := range []string{
+		"event", "minimal", "metadata", "plain_text_full", "full",
+		"event_id", "message_id",
+		"body_plain_text", "body_html",
+		"attachments",
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("printWatchOutputSchema output missing key %q", key)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hintMarkAsRead — sanitizeForTerminal integration
+// ---------------------------------------------------------------------------
+
+func TestHintMarkAsRead(t *testing.T) {
+	rt, _, stderr := newOutputRuntime(t)
+	// Inject ANSI escape + message ID to verify sanitization
+	hintMarkAsRead(rt, "me", "msg-\x1b[31m123")
+	out := stderr.String()
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("hintMarkAsRead should sanitize ANSI escapes, got: %q", out)
+	}
+	if !strings.Contains(out, "msg-123") {
+		t.Errorf("hintMarkAsRead should contain sanitized message ID, got: %q", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// intVal — json.Number
+// ---------------------------------------------------------------------------
+
+func TestIntVal_JsonNumber(t *testing.T) {
+	n := json.Number("42")
+	got := intVal(n)
+	if got != 42 {
+		t.Errorf("intVal(json.Number(\"42\")) = %d, want 42", got)
+	}
+}
+
+func TestIntVal_JsonNumberInvalid(t *testing.T) {
+	n := json.Number("not-a-number")
+	got := intVal(n)
+	if got != 0 {
+		t.Errorf("intVal(json.Number(\"not-a-number\")) = %d, want 0", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// toOriginalMessageForCompose
+// ---------------------------------------------------------------------------
+
+func TestToOriginalMessageForCompose(t *testing.T) {
+	out := normalizedMessageForCompose{
+		Subject:       "Test Subject\r\nBcc: evil@evil.com",
+		From:          mailAddressOutput{Email: "alice@example.com", Name: "Alice"},
+		To:            []mailAddressOutput{{Email: "bob@example.com", Name: "Bob"}},
+		CC:            []mailAddressOutput{{Email: "carol@example.com", Name: "Carol"}},
+		SMTPMessageID: "<msg-1@example.com>",
+		ThreadID:      "thread-1",
+		BodyHTML:      "<p>Hello</p>",
+		BodyPlainText: "Hello",
+		InternalDate:  "1711111111000",
+		References:    []string{"<ref-1@example.com>"},
+		ReplyTo:       "replyto@example.com",
+	}
+
+	orig := toOriginalMessageForCompose(out)
+
+	// Subject injection should be stripped
+	if strings.Contains(orig.subject, "\r") || strings.Contains(orig.subject, "\n") {
+		t.Errorf("subject should have CR/LF stripped, got: %q", orig.subject)
+	}
+	if !strings.Contains(orig.subject, "Test Subject") {
+		t.Errorf("subject should still contain original text, got: %q", orig.subject)
+	}
+
+	if orig.headFrom != "alice@example.com" {
+		t.Errorf("headFrom = %q, want alice@example.com", orig.headFrom)
+	}
+	if orig.headFromName != "Alice" {
+		t.Errorf("headFromName = %q, want Alice", orig.headFromName)
+	}
+	if orig.headTo != "bob@example.com" {
+		t.Errorf("headTo = %q, want bob@example.com", orig.headTo)
+	}
+	if orig.replyTo != "replyto@example.com" {
+		t.Errorf("replyTo = %q, want replyto@example.com", orig.replyTo)
+	}
+	if orig.smtpMessageId != "<msg-1@example.com>" {
+		t.Errorf("smtpMessageId = %q", orig.smtpMessageId)
+	}
+	if orig.threadId != "thread-1" {
+		t.Errorf("threadId = %q", orig.threadId)
+	}
+	if orig.bodyRaw != "<p>Hello</p>" {
+		t.Errorf("bodyRaw should prefer HTML, got: %q", orig.bodyRaw)
+	}
+	if orig.headDate == "" {
+		t.Error("headDate should be set from InternalDate")
+	}
+	if orig.references != "<ref-1@example.com>" {
+		t.Errorf("references = %q", orig.references)
+	}
+	if len(orig.toAddresses) != 1 || orig.toAddresses[0] != "bob@example.com" {
+		t.Errorf("toAddresses = %v", orig.toAddresses)
+	}
+	if len(orig.ccAddresses) != 1 || orig.ccAddresses[0] != "carol@example.com" {
+		t.Errorf("ccAddresses = %v", orig.ccAddresses)
+	}
+	if len(orig.toAddressesFull) != 1 {
+		t.Errorf("toAddressesFull = %v", orig.toAddressesFull)
+	}
+	if len(orig.ccAddressesFull) != 1 {
+		t.Errorf("ccAddressesFull = %v", orig.ccAddressesFull)
+	}
+}
+
+func TestToOriginalMessageForCompose_NoHTML(t *testing.T) {
+	out := normalizedMessageForCompose{
+		Subject:       "Plain email",
+		From:          mailAddressOutput{Email: "alice@example.com"},
+		BodyPlainText: "Just plain text",
+	}
+	orig := toOriginalMessageForCompose(out)
+	if orig.bodyRaw != "Just plain text" {
+		t.Errorf("bodyRaw should fall back to plaintext, got: %q", orig.bodyRaw)
+	}
+	if orig.headTo != "" {
+		t.Errorf("headTo should be empty when To list is empty, got: %q", orig.headTo)
+	}
+}
+
+func TestToOriginalMessageForCompose_EmptyReferences(t *testing.T) {
+	out := normalizedMessageForCompose{
+		From:       mailAddressOutput{Email: "alice@example.com"},
+		References: nil,
+	}
+	orig := toOriginalMessageForCompose(out)
+	if orig.references != "" {
+		t.Errorf("references should be empty, got: %q", orig.references)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// checkAttachmentSizeLimit
+// ---------------------------------------------------------------------------
+
+func TestCheckAttachmentSizeLimit_NoFiles(t *testing.T) {
+	if err := checkAttachmentSizeLimit(nil, 0); err != nil {
+		t.Fatalf("unexpected error for empty: %v", err)
+	}
+}
+
+func TestCheckAttachmentSizeLimit_CountExceeded(t *testing.T) {
+	err := checkAttachmentSizeLimit(nil, 0, MaxAttachmentCount+1)
+	if err == nil {
+		t.Fatal("expected error for count exceeded")
+	}
+	if !strings.Contains(err.Error(), "count") {
+		t.Errorf("error should mention count: %v", err)
+	}
+}
+
+func TestCheckAttachmentSizeLimit_SizeExceeded(t *testing.T) {
+	// extraBytes alone exceeds the limit
+	err := checkAttachmentSizeLimit(nil, MaxAttachmentBytes+1)
+	if err == nil {
+		t.Fatal("expected error for size exceeded")
+	}
+	if !strings.Contains(err.Error(), "25 MB") {
+		t.Errorf("error should mention 25 MB limit: %v", err)
+	}
+}
+
+func TestCheckAttachmentSizeLimit_WithFiles(t *testing.T) {
+	// Create a small temp file to exercise the file stat path
+	dir := t.TempDir()
+	f := filepath.Join(dir, "small.txt")
+	if err := os.WriteFile(f, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Use the temp dir as the CWD so the relative path works
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	err := checkAttachmentSizeLimit([]string{"./small.txt"}, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// downloadAttachmentContent — size limit enforcement
+// ---------------------------------------------------------------------------
+
+func TestDownloadAttachmentContent_HTTP4xx(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	rt := newDownloadRuntime(t, srv.Client())
+	_, err := downloadAttachmentContent(rt, srv.URL+"/missing")
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("expected HTTP 404 error, got: %v", err)
+	}
+}
+
+func TestDownloadAttachmentContent_SizeLimit(t *testing.T) {
+	// Return a response that claims to be larger than MaxAttachmentDownloadBytes
+	// We can't actually write 35MB in a test, but we can test the limit logic
+	// by creating a server that returns slightly more than the limit.
+	// For efficiency, just verify the error message pattern with a small payload
+	// and a temporarily reduced limit is not feasible. Instead test the boundary.
+	bigPayload := strings.Repeat("x", MaxAttachmentDownloadBytes+1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, bigPayload)
+	}))
+	defer srv.Close()
+
+	rt := newDownloadRuntime(t, srv.Client())
+	_, err := downloadAttachmentContent(rt, srv.URL+"/big")
+	if err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Errorf("expected size limit error, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// buildReplyAllRecipients — no-mutation of excluded map (tests the copy fix)
+// ---------------------------------------------------------------------------
+
+func TestBuildReplyAllRecipients_DoesNotMutateExcluded(t *testing.T) {
+	excluded := map[string]bool{"blocked@example.com": true}
+	originalLen := len(excluded)
+	buildReplyAllRecipients("alice@example.com", nil, nil, "me@example.com", excluded, false)
+	if len(excluded) != originalLen {
+		t.Errorf("excluded map was mutated: had %d entries, now has %d", originalLen, len(excluded))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// addInlineImagesToBuilder — with empty CID skip
+// ---------------------------------------------------------------------------
+
+func TestAddInlineImagesToBuilder_EmptyCIDSkipped(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "imagedata")
+	}))
+	defer srv.Close()
+
+	rt := newDownloadRuntime(t, srv.Client())
+	bld := emlbuilder.New().TextBody([]byte("test"))
+	images := []inlineSourcePart{
+		{ID: "img1", Filename: "logo.png", ContentType: "image/png", CID: "", DownloadURL: srv.URL + "/img1"},
+	}
+	_, err := addInlineImagesToBuilder(rt, bld, images)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAddInlineImagesToBuilder_Success(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "imagedata")
+	}))
+	defer srv.Close()
+
+	rt := newDownloadRuntime(t, srv.Client())
+	bld := emlbuilder.New().
+		From("Test", "test@example.com").
+		To("Recipient", "to@example.com").
+		Subject("test").
+		HTMLBody([]byte("<img src='cid:banner'>"))
+	images := []inlineSourcePart{
+		{ID: "img1", Filename: "banner.png", ContentType: "image/png", CID: "cid:banner", DownloadURL: srv.URL + "/img1"},
+	}
+	result, err := addInlineImagesToBuilder(rt, bld, images)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	raw, err := result.BuildBase64URL()
+	if err != nil {
+		t.Fatalf("failed to build EML: %v", err)
+	}
+	if raw == "" {
+		t.Error("expected non-empty EML output")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// normalizeInlineCID
+// ---------------------------------------------------------------------------
+
+func TestNormalizeInlineCID(t *testing.T) {
+	tests := []struct {
+		input, want string
+	}{
+		{"cid:banner", "banner"},
+		{"CID:banner", "banner"},
+		{"<banner>", "banner"},
+		{"cid:<banner>", "banner"},
+		{"  cid:<banner>  ", "banner"},
+		{"plain", "plain"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		got := normalizeInlineCID(tt.input)
+		if got != tt.want {
+			t.Errorf("normalizeInlineCID(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestResolveComposeMailboxID(t *testing.T) {
+	tests := []struct {
+		name string
+		from string
+		want string
+	}{
+		{"default", "", "me"},
+		{"explicit from", "shared@example.com", "shared@example.com"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := &cobra.Command{Use: "test"}
+			cmd.Flags().String("from", "", "")
+			if tt.from != "" {
+				_ = cmd.Flags().Set("from", tt.from)
+			}
+			rt := &common.RuntimeContext{Cmd: cmd}
+			if got := resolveComposeMailboxID(rt); got != tt.want {
+				t.Errorf("resolveComposeMailboxID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseNetAddrs_Dedup(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string // expected email addresses in order
+	}{
+		{"no duplicates", "a@x.com, b@x.com", []string{"a@x.com", "b@x.com"}},
+		{"exact duplicate", "a@x.com, a@x.com", []string{"a@x.com"}},
+		{"case-insensitive duplicate", "Alice@X.COM, alice@x.com", []string{"Alice@X.COM"}},
+		{"mixed with names", "Alice <a@x.com>, Bob <b@x.com>, a@x.com", []string{"a@x.com", "b@x.com"}},
+		{"triple duplicate", "a@x.com, a@x.com, a@x.com", []string{"a@x.com"}},
+		{"empty", "", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseNetAddrs(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseNetAddrs(%q) returned %d addrs, want %d: %v", tt.input, len(got), len(tt.want), got)
+			}
+			for i, addr := range got {
+				if addr.Address != tt.want[i] {
+					t.Errorf("parseNetAddrs(%q)[%d].Address = %q, want %q", tt.input, i, addr.Address, tt.want[i])
+				}
+			}
+		})
+	}
+
+	// Verify dedup is per-field only, NOT cross-field: separate calls must
+	// maintain independent seen sets so the same address can appear in both
+	// To and CC.
+	t.Run("no cross-field dedup", func(t *testing.T) {
+		shared := "overlap@x.com"
+		toAddrs := parseNetAddrs(shared)
+		ccAddrs := parseNetAddrs(shared + ", other@x.com")
+		if len(toAddrs) != 1 || toAddrs[0].Address != shared {
+			t.Fatalf("to: got %v", toAddrs)
+		}
+		if len(ccAddrs) != 2 {
+			t.Fatalf("cc should have 2 addrs (no cross-field dedup), got %v", ccAddrs)
+		}
+		if ccAddrs[0].Address != shared {
+			t.Errorf("cc[0] = %q, want %q", ccAddrs[0].Address, shared)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// validateRecipientCount
+// ---------------------------------------------------------------------------
+
+func TestValidateRecipientCount(t *testing.T) {
+	t.Run("under limit", func(t *testing.T) {
+		err := validateRecipientCount("a@x.com, b@x.com", "c@x.com", "d@x.com")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("empty fields", func(t *testing.T) {
+		err := validateRecipientCount("", "", "")
+		if err != nil {
+			t.Fatalf("unexpected error for empty fields: %v", err)
+		}
+	})
+
+	t.Run("exactly at limit", func(t *testing.T) {
+		// Build a list of exactly MaxRecipientCount addresses
+		addrs := make([]string, MaxRecipientCount)
+		for i := range addrs {
+			addrs[i] = fmt.Sprintf("user%d@example.com", i)
+		}
+		all := strings.Join(addrs, ",")
+		err := validateRecipientCount(all, "", "")
+		if err != nil {
+			t.Fatalf("should accept exactly %d recipients, got error: %v", MaxRecipientCount, err)
+		}
+	})
+
+	t.Run("exceeds limit", func(t *testing.T) {
+		addrs := make([]string, MaxRecipientCount+1)
+		for i := range addrs {
+			addrs[i] = fmt.Sprintf("user%d@example.com", i)
+		}
+		all := strings.Join(addrs, ",")
+		err := validateRecipientCount(all, "", "")
+		if err == nil {
+			t.Fatal("expected error for exceeding recipient limit")
+		}
+		if !strings.Contains(err.Error(), "exceeds the limit") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("combined across fields", func(t *testing.T) {
+		// Split across To, CC, BCC to exceed limit
+		half := MaxRecipientCount / 2
+		toAddrs := make([]string, half)
+		for i := range toAddrs {
+			toAddrs[i] = fmt.Sprintf("to%d@example.com", i)
+		}
+		ccAddrs := make([]string, half)
+		for i := range ccAddrs {
+			ccAddrs[i] = fmt.Sprintf("cc%d@example.com", i)
+		}
+		// This puts us at MaxRecipientCount, add 1 BCC to exceed
+		err := validateRecipientCount(
+			strings.Join(toAddrs, ","),
+			strings.Join(ccAddrs, ","),
+			"bcc-extra@example.com",
+		)
+		if err == nil {
+			t.Fatal("expected error when To+CC+BCC exceeds limit")
+		}
+	})
+
+	t.Run("deduplication within field", func(t *testing.T) {
+		// ParseMailboxList deduplicates, so duplicates should not inflate count
+		err := validateRecipientCount("a@x.com, a@x.com, a@x.com", "", "")
+		if err != nil {
+			t.Fatalf("duplicates should be deduplicated, got error: %v", err)
+		}
+	})
+}
+
+func TestValidateComposeHasAtLeastOneRecipient_AlsoChecksCount(t *testing.T) {
+	// Verify that validateComposeHasAtLeastOneRecipient also enforces the count limit
+	addrs := make([]string, MaxRecipientCount+1)
+	for i := range addrs {
+		addrs[i] = fmt.Sprintf("user%d@example.com", i)
+	}
+	all := strings.Join(addrs, ",")
+	err := validateComposeHasAtLeastOneRecipient(all, "", "")
+	if err == nil {
+		t.Fatal("expected error for exceeding recipient limit via validateComposeHasAtLeastOneRecipient")
+	}
+	if !strings.Contains(err.Error(), "exceeds the limit") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}

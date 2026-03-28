@@ -1,0 +1,144 @@
+// Copyright (c) 2026 Lark Technologies Pte. Ltd.
+// SPDX-License-Identifier: MIT
+
+package im
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/larksuite/cli/internal/output"
+	"github.com/larksuite/cli/internal/validate"
+	"github.com/larksuite/cli/shortcuts/common"
+	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
+)
+
+var ImMessagesResourcesDownload = common.Shortcut{
+	Service:     "im",
+	Command:     "+messages-resources-download",
+	Description: "Download images/files from a message; user/bot; downloads image/file resources by message-id and file-key to a safe relative output path",
+	Risk:        "write",
+	Scopes:      []string{"im:message:readonly"},
+	AuthTypes:   []string{"user", "bot"},
+	Flags: []common.Flag{
+		{Name: "message-id", Desc: "message ID (om_xxx)", Required: true},
+		{Name: "file-key", Desc: "resource key (img_xxx or file_xxx)", Required: true},
+		{Name: "type", Desc: "resource type (image or file)", Required: true, Enum: []string{"image", "file"}},
+		{Name: "output", Desc: "local save path (relative only, no .. traversal; defaults to file_key)"},
+	},
+	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
+		fileKey := runtime.Str("file-key")
+		outputPath := runtime.Str("output")
+		if outputPath == "" {
+			outputPath = fileKey
+		}
+		return common.NewDryRunAPI().
+			GET("/open-apis/im/v1/messages/:message_id/resources/:file_key").
+			Params(map[string]interface{}{"type": runtime.Str("type")}).
+			Set("message_id", runtime.Str("message-id")).Set("file_key", fileKey).
+			Set("type", runtime.Str("type")).Set("output", outputPath)
+	},
+	Validate: func(ctx context.Context, runtime *common.RuntimeContext) error {
+		if messageId := runtime.Str("message-id"); messageId == "" {
+			return output.ErrValidation("--message-id is required (om_xxx)")
+		} else if _, err := validateMessageID(messageId); err != nil {
+			return err
+		}
+		relPath, err := normalizeDownloadOutputPath(runtime.Str("file-key"), runtime.Str("output"))
+		if err != nil {
+			return output.ErrValidation("%s", err)
+		}
+		if _, err := validate.SafeOutputPath(relPath); err != nil {
+			return output.ErrValidation("unsafe output path: %s", err)
+		}
+		return nil
+	},
+	Execute: func(ctx context.Context, runtime *common.RuntimeContext) error {
+		messageId := runtime.Str("message-id")
+		fileKey := runtime.Str("file-key")
+		fileType := runtime.Str("type")
+		relPath, err := normalizeDownloadOutputPath(fileKey, runtime.Str("output"))
+		if err != nil {
+			return output.ErrValidation("invalid output path: %s", err)
+		}
+		safePath, err := validate.SafeOutputPath(relPath)
+		if err != nil {
+			return output.ErrValidation("unsafe output path: %s", err)
+		}
+
+		sizeBytes, err := downloadIMResourceToPath(ctx, runtime, messageId, fileKey, fileType, safePath)
+		if err != nil {
+			return err
+		}
+
+		runtime.Out(map[string]interface{}{"saved_path": safePath, "size_bytes": sizeBytes}, nil)
+		return nil
+	},
+}
+
+func normalizeDownloadOutputPath(fileKey, outputPath string) (string, error) {
+	fileKey = strings.TrimSpace(fileKey)
+	if fileKey == "" {
+		return "", fmt.Errorf("file-key cannot be empty")
+	}
+	if strings.ContainsAny(fileKey, "/\\") {
+		return "", fmt.Errorf("file-key cannot contain path separators")
+	}
+	if outputPath == "" {
+		return fileKey, nil
+	}
+	outputPath = filepath.Clean(strings.TrimSpace(outputPath))
+	if outputPath == "." {
+		return "", fmt.Errorf("path cannot be empty")
+	}
+	if filepath.IsAbs(outputPath) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+	if outputPath == ".." || strings.HasPrefix(outputPath, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path cannot escape the current working directory")
+	}
+	return outputPath, nil
+}
+
+const defaultIMResourceDownloadTimeout = 120 * time.Second
+
+func downloadIMResourceToPath(ctx context.Context, runtime *common.RuntimeContext, messageID, fileKey, fileType, safePath string) (int64, error) {
+	query := larkcore.QueryParams{}
+	query.Set("type", fileType)
+	downloadResp, err := runtime.DoAPIStream(ctx, &larkcore.ApiReq{
+		HttpMethod: http.MethodGet,
+		ApiPath:    "/open-apis/im/v1/messages/:message_id/resources/:file_key",
+		PathParams: larkcore.PathParams{
+			"message_id": messageID,
+			"file_key":   fileKey,
+		},
+		QueryParams: query,
+	}, defaultIMResourceDownloadTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer downloadResp.Body.Close()
+
+	if downloadResp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(downloadResp.Body, 4096))
+		if len(body) > 0 {
+			return 0, output.ErrNetwork("download failed: HTTP %d: %s", downloadResp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		return 0, output.ErrNetwork("download failed: HTTP %d", downloadResp.StatusCode)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(safePath), 0700); err != nil {
+		return 0, output.Errorf(output.ExitInternal, "api_error", "cannot create parent directory: %s", err)
+	}
+	sizeBytes, err := validate.AtomicWriteFromReader(safePath, downloadResp.Body, 0600)
+	if err != nil {
+		return 0, output.Errorf(output.ExitInternal, "api_error", "cannot create file: %s", err)
+	}
+	return sizeBytes, nil
+}

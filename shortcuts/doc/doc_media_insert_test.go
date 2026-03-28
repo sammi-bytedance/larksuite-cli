@@ -1,0 +1,163 @@
+// Copyright (c) 2026 Lark Technologies Pte. Ltd.
+// SPDX-License-Identifier: MIT
+
+package doc
+
+import (
+	"reflect"
+	"testing"
+)
+
+func TestBuildCreateBlockDataUsesConcreteAppendIndex(t *testing.T) {
+	t.Parallel()
+
+	got := buildCreateBlockData("image", 3)
+	want := map[string]interface{}{
+		"children": []interface{}{
+			map[string]interface{}{
+				"block_type": 27,
+				"image":      map[string]interface{}{},
+			},
+		},
+		"index": 3,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildCreateBlockData() = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildCreateBlockDataForFileIncludesFilePayload(t *testing.T) {
+	t.Parallel()
+
+	got := buildCreateBlockData("file", 1)
+	want := map[string]interface{}{
+		"children": []interface{}{
+			map[string]interface{}{
+				"block_type": 23,
+				"file":       map[string]interface{}{},
+			},
+		},
+		"index": 1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildCreateBlockData(file) = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildDeleteBlockDataUsesHalfOpenInterval(t *testing.T) {
+	t.Parallel()
+
+	got := buildDeleteBlockData(5)
+	want := map[string]interface{}{
+		"start_index": 5,
+		"end_index":   6,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildDeleteBlockData() = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildBatchUpdateDataForImage(t *testing.T) {
+	t.Parallel()
+
+	got := buildBatchUpdateData("blk_1", "image", "file_tok", "center", "caption text")
+	want := map[string]interface{}{
+		"requests": []interface{}{
+			map[string]interface{}{
+				"block_id": "blk_1",
+				"replace_image": map[string]interface{}{
+					"token": "file_tok",
+					"align": 2,
+					"caption": map[string]interface{}{
+						"content": "caption text",
+					},
+				},
+			},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildBatchUpdateData(image) = %#v, want %#v", got, want)
+	}
+}
+
+func TestBuildBatchUpdateDataForFile(t *testing.T) {
+	t.Parallel()
+
+	got := buildBatchUpdateData("blk_2", "file", "file_tok", "", "")
+	want := map[string]interface{}{
+		"requests": []interface{}{
+			map[string]interface{}{
+				"block_id": "blk_2",
+				"replace_file": map[string]interface{}{
+					"token": "file_tok",
+				},
+			},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildBatchUpdateData(file) = %#v, want %#v", got, want)
+	}
+}
+
+func TestExtractAppendTargetUsesRootChildrenCount(t *testing.T) {
+	t.Parallel()
+
+	rootData := map[string]interface{}{
+		"block": map[string]interface{}{
+			"block_id": "root_block",
+			"children": []interface{}{"c1", "c2", "c3"},
+		},
+	}
+
+	blockID, index, err := extractAppendTarget(rootData, "fallback")
+	if err != nil {
+		t.Fatalf("extractAppendTarget() unexpected error: %v", err)
+	}
+	if blockID != "root_block" {
+		t.Fatalf("extractAppendTarget() blockID = %q, want %q", blockID, "root_block")
+	}
+	if index != 3 {
+		t.Fatalf("extractAppendTarget() index = %d, want 3", index)
+	}
+}
+
+func TestExtractCreatedBlockTargetsForImage(t *testing.T) {
+	t.Parallel()
+
+	createData := map[string]interface{}{
+		"children": []interface{}{
+			map[string]interface{}{
+				"block_id": "img_outer",
+			},
+		},
+	}
+
+	blockID, uploadParentNode, replaceBlockID := extractCreatedBlockTargets(createData, "image")
+	if blockID != "img_outer" || uploadParentNode != "img_outer" || replaceBlockID != "img_outer" {
+		t.Fatalf("extractCreatedBlockTargets(image) = (%q, %q, %q)", blockID, uploadParentNode, replaceBlockID)
+	}
+}
+
+func TestExtractCreatedBlockTargetsForFileUsesNestedFileBlock(t *testing.T) {
+	t.Parallel()
+
+	createData := map[string]interface{}{
+		"children": []interface{}{
+			map[string]interface{}{
+				"block_id": "view_outer",
+				"children": []interface{}{"file_inner"},
+			},
+		},
+	}
+
+	blockID, uploadParentNode, replaceBlockID := extractCreatedBlockTargets(createData, "file")
+	if blockID != "view_outer" {
+		t.Fatalf("extractCreatedBlockTargets(file) blockID = %q, want %q", blockID, "view_outer")
+	}
+	if uploadParentNode != "file_inner" {
+		t.Fatalf("extractCreatedBlockTargets(file) uploadParentNode = %q, want %q", uploadParentNode, "file_inner")
+	}
+	if replaceBlockID != "file_inner" {
+		t.Fatalf("extractCreatedBlockTargets(file) replaceBlockID = %q, want %q", replaceBlockID, "file_inner")
+	}
+}

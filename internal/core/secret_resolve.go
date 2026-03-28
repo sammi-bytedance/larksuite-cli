@@ -1,0 +1,61 @@
+// Copyright (c) 2026 Lark Technologies Pte. Ltd.
+// SPDX-License-Identifier: MIT
+
+package core
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/larksuite/cli/internal/keychain"
+)
+
+const secretKeyPrefix = "appsecret:"
+
+func secretAccountKey(appId string) string {
+	return secretKeyPrefix + appId
+}
+
+// ResolveSecretInput resolves a SecretInput to a plain string.
+// SecretRef objects are resolved by source (file / keychain).
+func ResolveSecretInput(s SecretInput, kc keychain.KeychainAccess) (string, error) {
+	if s.Ref == nil {
+		return s.Plain, nil
+	}
+	switch s.Ref.Source {
+	case "file":
+		data, err := os.ReadFile(s.Ref.ID)
+		if err != nil {
+			return "", fmt.Errorf("failed to read secret file %s: %w", s.Ref.ID, err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	case "keychain":
+		return kc.Get(keychain.LarkCliService, s.Ref.ID)
+	default:
+		return "", fmt.Errorf("unknown secret source: %s", s.Ref.Source)
+	}
+}
+
+// ForStorage determines how to store a secret in config.json.
+// - SecretRef → preserved as-is
+// - Plain text → stored in keychain, returns keychain SecretRef
+// Returns error if keychain is unavailable (no silent plaintext fallback).
+func ForStorage(appId string, input SecretInput, kc keychain.KeychainAccess) (SecretInput, error) {
+	if !input.IsPlain() {
+		return input, nil // SecretRef → keep as-is
+	}
+	key := secretAccountKey(appId)
+	if err := kc.Set(keychain.LarkCliService, key, input.Plain); err != nil {
+		return SecretInput{}, fmt.Errorf("keychain unavailable: %w\nhint: use file: reference in config to bypass keychain", err)
+	}
+	return SecretInput{Ref: &SecretRef{Source: "keychain", ID: key}}, nil
+}
+
+// RemoveSecretStore cleans up keychain entries when an app is removed.
+// Errors are intentionally ignored — cleanup is best-effort.
+func RemoveSecretStore(input SecretInput, kc keychain.KeychainAccess) {
+	if input.IsSecretRef() && input.Ref.Source == "keychain" {
+		_ = kc.Remove(keychain.LarkCliService, input.Ref.ID)
+	}
+}
