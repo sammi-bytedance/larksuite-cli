@@ -22,11 +22,27 @@ func resetInit() {
 	initOnce = sync.Once{}
 	mergedServices = make(map[string]map[string]interface{})
 	mergedProjectList = nil
+	embeddedVersion = ""
 	cachedAllScopes = nil
+	cachedScopePriorities = nil
+	cachedAutoApproveSet = nil
+	cachedPlatformAutoApprove = nil
+	cachedOverrideAutoAllow = nil
+	cachedOverrideAutoDeny = nil
 	refreshOnce = sync.Once{}
 	configuredBrand = ""
 	enableRemoteMeta = true // tests exercise remote logic
 	testMetaURL = ""
+}
+
+func TestResetInitClearsEmbeddedVersion(t *testing.T) {
+	embeddedVersion = "stale-version"
+
+	resetInit()
+
+	if embeddedVersion != "" {
+		t.Fatalf("embeddedVersion = %q, want empty", embeddedVersion)
+	}
 }
 
 // hasEmbeddedServices returns true if meta_data.json with real services is compiled in.
@@ -296,6 +312,30 @@ func TestOverlayMergedServices(t *testing.T) {
 	// brand_new should be added
 	if _, ok := mergedServices["brand_new"]; !ok {
 		t.Error("expected brand_new to be added")
+	}
+}
+
+func TestOverlayMergedServicesDoesNotPolluteFollowingInit(t *testing.T) {
+	resetInit()
+	t.Setenv("LARKSUITE_CLI_CONFIG_DIR", t.TempDir())
+	t.Setenv("LARKSUITE_CLI_REMOTE_META", "off")
+
+	const leakedExisting = "test_isolation_existing_sentinel"
+	const leakedOverlay = "test_isolation_overlay_sentinel"
+
+	mergedServices = map[string]map[string]interface{}{
+		leakedExisting: {"name": leakedExisting, "version": "v1"},
+	}
+	overlayMergedServices(&MergedRegistry{Services: []map[string]interface{}{{"name": leakedOverlay, "version": "v1"}}})
+
+	resetInit()
+	Init()
+
+	if spec := LoadFromMeta(leakedExisting); spec != nil {
+		t.Fatalf("polluted service %q survived resetInit", leakedExisting)
+	}
+	if spec := LoadFromMeta(leakedOverlay); spec != nil {
+		t.Fatalf("polluted service %q survived resetInit", leakedOverlay)
 	}
 }
 
