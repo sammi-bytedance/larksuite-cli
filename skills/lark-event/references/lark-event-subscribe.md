@@ -100,7 +100,7 @@ Agent pipelines should **always use `--compact --quiet`**.
 
 ## Catch-all Event Types
 
-The following 24 event types are registered in catch-all mode (when `--event-types` is omitted):
+The following 25 event types are registered in catch-all mode (when `--event-types` is omitted):
 
 ### IM
 
@@ -160,6 +160,14 @@ The following 24 event types are registered in catch-all mode (when `--event-typ
 | Event Type | Description | Required Scope |
 |-----------|-------------|---------------|
 | `drive.notice.comment_add_v1` | Drive comment added | `drive:drive:readonly` |
+
+### Card
+
+| Event Type | Description | Required Scope |
+|-----------|-------------|---------------|
+| `card.action.trigger` | User interacts with a card button/select/input | `im:message:receive_as_bot` |
+
+> For the full send → listen → update card workflow, see [lark-im-card-callback](../../lark-im/references/lark-im-card-callback.md).
 
 See the full list at [Lark Event List](https://open.feishu.cn/document/server-docs/event-subscription-guide/event-list).
 

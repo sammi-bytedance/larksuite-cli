@@ -48,7 +48,9 @@ When using bot identity (`--as bot`) to fetch messages (e.g. `+chat-messages-lis
 
 ### Card Messages (Interactive)
 
-Card messages (`interactive` type) are not yet supported for compact conversion in event subscriptions. The raw event data will be returned instead, with a hint printed to stderr.
+Card messages (`interactive` type) received as IM messages (`im.message.receive_v1` with `message_type: "interactive"`) are not yet supported for compact conversion. The raw event data will be returned instead, with a hint printed to stderr.
+
+For **card button callbacks** (`card.action.trigger`), see [lark-im-card-callback](references/lark-im-card-callback.md) for the full send → listen → update workflow.
 
 ## Shortcuts（推荐优先使用）
 

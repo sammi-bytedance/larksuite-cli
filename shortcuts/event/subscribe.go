@@ -76,6 +76,7 @@ var commonEventTypes = []string{
 	"task.task.update_tenant_v1",
 	"task.task.comment_updated_v1",
 	"drive.notice.comment_add_v1",
+	"card.action.trigger",
 }
 
 var EventSubscribe = common.Shortcut{

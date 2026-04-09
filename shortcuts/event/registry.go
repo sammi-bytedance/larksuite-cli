@@ -55,5 +55,7 @@ func DefaultRegistry() *ProcessorRegistry {
 	// im.chat
 	_ = r.Register(&ImChatUpdatedProcessor{})
 	_ = r.Register(&ImChatDisbandedProcessor{})
+	// card
+	_ = r.Register(&CardActionTriggerProcessor{})
 	return r
 }
