@@ -6,22 +6,24 @@ package mail
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	netmail "net/mail"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/larksuite/cli/extension/fileio"
 	"github.com/larksuite/cli/internal/auth"
 	"github.com/larksuite/cli/internal/output"
 	"github.com/larksuite/cli/internal/validate"
 	"github.com/larksuite/cli/shortcuts/common"
+	draftpkg "github.com/larksuite/cli/shortcuts/mail/draft"
 	"github.com/larksuite/cli/shortcuts/mail/emlbuilder"
 )
 
@@ -194,9 +196,14 @@ func resolveMailboxID(runtime *common.RuntimeContext) string {
 	return id
 }
 
-// resolveComposeMailboxID returns the mailbox ID for compose shortcuts,
-// derived from --from flag. Falls back to "me" when --from is not specified.
+// resolveComposeMailboxID returns the mailbox ID for compose shortcuts.
+// Priority: --mailbox > --from > "me".
+// When sending via an alias (send_as), use --mailbox for the owning mailbox
+// and --from for the alias sender address.
 func resolveComposeMailboxID(runtime *common.RuntimeContext) string {
+	if mb := runtime.Str("mailbox"); mb != "" {
+		return mb
+	}
 	if from := runtime.Str("from"); from != "" {
 		return from
 	}
@@ -250,23 +257,38 @@ func extractPrimaryEmail(data map[string]interface{}) string {
 	return ""
 }
 
-// fetchCurrentUserEmail retrieves the current mailbox primary email.
-func fetchCurrentUserEmail(runtime *common.RuntimeContext) string {
+// resolveComposeSenderEmail determines the sender email for compose shortcuts.
+// Priority: --from > --mailbox > profile("me").
+// The profile API only supports "me", so when --mailbox is set to a non-"me"
+// address (e.g. a shared mailbox), its value is used directly as the sender.
+func resolveComposeSenderEmail(runtime *common.RuntimeContext) string {
+	if from := runtime.Str("from"); from != "" {
+		return from
+	}
+	if mb := runtime.Str("mailbox"); mb != "" && mb != "me" {
+		return mb
+	}
 	email, _ := fetchMailboxPrimaryEmail(runtime, "me")
 	return email
 }
 
-// fetchSelfEmailSet returns a set containing the primary email of the given
-// mailbox for reply-all exclusion. Pass the resolved mailboxID (from
-// resolveComposeMailboxID) so that when --from selects a different mailbox,
-// only that mailbox's own address is excluded — not the "me" primary email.
+// fetchSelfEmailSet returns a set of addresses to exclude as "self" in
+// reply-all. It always tries profile("me"); when mailboxID or senderEmail
+// differ from "me", those are added to the set as well so that shared-
+// mailbox and alias addresses are also excluded.
 func fetchSelfEmailSet(runtime *common.RuntimeContext, mailboxID string) map[string]bool {
-	if mailboxID == "" {
-		mailboxID = "me"
-	}
 	set := make(map[string]bool)
-	if email, _ := fetchMailboxPrimaryEmail(runtime, mailboxID); email != "" {
+	// Always include the "me" primary email.
+	if email, _ := fetchMailboxPrimaryEmail(runtime, "me"); email != "" {
 		set[strings.ToLower(email)] = true
+	}
+	// Include mailboxID itself (covers shared mailbox addresses).
+	if mailboxID != "" && mailboxID != "me" {
+		set[strings.ToLower(mailboxID)] = true
+	}
+	// Include --from alias address so it's excluded from reply-all recipients.
+	if from := runtime.Str("from"); from != "" {
+		set[strings.ToLower(from)] = true
 	}
 	return set
 }
@@ -1770,11 +1792,33 @@ func normalizeInlineCID(cid string) string {
 	return strings.TrimSpace(trimmed)
 }
 
-func addInlineImagesToBuilder(runtime *common.RuntimeContext, bld emlbuilder.Builder, images []inlineSourcePart) (emlbuilder.Builder, error) {
+// validateInlineCIDs checks bidirectional CID consistency between HTML body and
+// inline MIME parts — the same checks as postProcessInlineImages in draft-edit.
+//  1. Every cid: reference in HTML must have a corresponding inline part (checked
+//     against userCIDs + extraCIDs combined).
+//  2. Every user-provided inline part must be referenced in HTML (orphan check
+//     against userCIDs only — extraCIDs such as source-message images in
+//     reply/forward are excluded because quoting may drop some references).
+func validateInlineCIDs(html string, userCIDs, extraCIDs []string) error {
+	allCIDs := append(append([]string{}, userCIDs...), extraCIDs...)
+	if err := draftpkg.ValidateCIDReferences(html, allCIDs); err != nil {
+		return err
+	}
+	if len(userCIDs) > 0 {
+		orphaned := draftpkg.FindOrphanedCIDs(html, userCIDs)
+		if len(orphaned) > 0 {
+			return fmt.Errorf("inline images with cids %v are not referenced by any <img src=\"cid:...\"> in the HTML body and will appear as unexpected attachments; remove unused --inline entries or add matching <img> tags", orphaned)
+		}
+	}
+	return nil
+}
+
+func addInlineImagesToBuilder(runtime *common.RuntimeContext, bld emlbuilder.Builder, images []inlineSourcePart) (emlbuilder.Builder, []string, error) {
+	var cids []string
 	for _, img := range images {
 		content, err := downloadAttachmentContent(runtime, img.DownloadURL)
 		if err != nil {
-			return bld, fmt.Errorf("failed to download inline resource %s: %w", img.Filename, err)
+			return bld, nil, fmt.Errorf("failed to download inline resource %s: %w", img.Filename, err)
 		}
 		cid := normalizeInlineCID(img.CID)
 		if cid == "" {
@@ -1785,8 +1829,9 @@ func addInlineImagesToBuilder(runtime *common.RuntimeContext, bld emlbuilder.Bui
 			contentType = "application/octet-stream"
 		}
 		bld = bld.AddInline(content, contentType, img.Filename, cid)
+		cids = append(cids, cid)
 	}
-	return bld, nil
+	return bld, cids, nil
 }
 
 // InlineSpec represents one inline image entry from the --inline JSON array.
@@ -1834,7 +1879,7 @@ func inlineSpecFilePaths(specs []InlineSpec) []string {
 // MaxAttachmentCount or the combined size exceeds MaxAttachmentBytes.
 // filePaths are read via os.Stat (no full read); extraBytes / extraCount account for
 // already-loaded content (e.g. downloaded original attachments in +forward).
-func checkAttachmentSizeLimit(filePaths []string, extraBytes int64, extraCount ...int) error {
+func checkAttachmentSizeLimit(fio fileio.FileIO, filePaths []string, extraBytes int64, extraCount ...int) error {
 	extra := 0
 	for _, c := range extraCount {
 		extra += c
@@ -1845,12 +1890,11 @@ func checkAttachmentSizeLimit(filePaths []string, extraBytes int64, extraCount .
 	}
 	totalBytes := extraBytes
 	for _, p := range filePaths {
-		safePath, err := validate.SafeInputPath(p)
+		info, err := fio.Stat(p)
 		if err != nil {
-			return fmt.Errorf("unsafe attachment path %s: %w", p, err)
-		}
-		info, err := os.Stat(safePath)
-		if err != nil {
+			if errors.Is(err, fileio.ErrPathValidation) {
+				return fmt.Errorf("unsafe attachment path %s: %w", p, err)
+			}
 			return fmt.Errorf("failed to stat attachment %s: %w", p, err)
 		}
 		totalBytes += info.Size()
@@ -1952,7 +1996,7 @@ func validateRecipientCount(to, cc, bcc string) error {
 	return nil
 }
 
-func validateComposeInlineAndAttachments(attachFlag, inlineFlag string, plainText bool, body string) error {
+func validateComposeInlineAndAttachments(fio fileio.FileIO, attachFlag, inlineFlag string, plainText bool, body string) error {
 	if strings.TrimSpace(inlineFlag) != "" {
 		if plainText {
 			return fmt.Errorf("--inline is not supported with --plain-text (inline images require HTML body)")
@@ -1961,13 +2005,14 @@ func validateComposeInlineAndAttachments(attachFlag, inlineFlag string, plainTex
 			return fmt.Errorf("--inline requires an HTML body (the provided body appears to be plain text; add HTML tags or remove --inline)")
 		}
 	}
+	// Validate explicitly provided files (--attach + --inline) early so that
+	// dry-run and reply/forward can catch local errors before Execute.
+	// Auto-resolved local images are only known at Execute time, so Execute
+	// performs a second, complete size check that includes them.
 	inlineSpecs, err := parseInlineSpecs(inlineFlag)
 	if err != nil {
 		return err
 	}
 	allFiles := append(splitByComma(attachFlag), inlineSpecFilePaths(inlineSpecs)...)
-	if err := checkAttachmentSizeLimit(allFiles, 0); err != nil {
-		return err
-	}
-	return nil
+	return checkAttachmentSizeLimit(fio, allFiles, 0)
 }
