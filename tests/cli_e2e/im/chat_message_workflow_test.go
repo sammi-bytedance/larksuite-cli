@@ -70,6 +70,12 @@ func TestIM_ChatMessageWorkflowAsUser(t *testing.T) {
 				continue
 			}
 			require.True(t, strings.Contains(item.Get("content").String(), messageText), "stdout:\n%s", result.Stdout)
+			requireChatMessageAppLink(
+				t,
+				item.Get("message_app_link").String(),
+				item.Get("chat_id").String(),
+				item.Get("message_position").String(),
+			)
 			found = true
 			break
 		}

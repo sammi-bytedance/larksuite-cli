@@ -41,5 +41,12 @@ func TestIM_MessageGetWorkflowAsUser(t *testing.T) {
 		require.Len(t, messages, 1, "stdout:\n%s", result.Stdout)
 		require.Equal(t, messageID, messages[0].Get("message_id").String(), "stdout:\n%s", result.Stdout)
 		require.True(t, strings.Contains(messages[0].Get("content").String(), messageText), "stdout:\n%s", result.Stdout)
+
+		requireChatMessageAppLink(
+			t,
+			messages[0].Get("message_app_link").String(),
+			messages[0].Get("chat_id").String(),
+			messages[0].Get("message_position").String(),
+		)
 	})
 }

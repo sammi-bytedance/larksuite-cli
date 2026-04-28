@@ -4,9 +4,14 @@
 package convertlib
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
+	"net/url"
+	"strconv"
 	"strings"
 
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
@@ -148,6 +153,29 @@ func FormatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext,
 		msg["reply_to"] = pid
 	}
 
+	// Preserve API-provided fields (even if this formatter doesn't otherwise use them).
+	if v, ok := m["chat_id"]; ok {
+		msg["chat_id"] = v
+	}
+	if v, ok := m["message_position"]; ok {
+		msg["message_position"] = v
+	}
+	if v, ok := m["thread_message_position"]; ok {
+		msg["thread_message_position"] = v
+	}
+	if v, ok := m["message_app_link"]; ok {
+		msg["message_app_link"] = v
+	}
+
+	// Assemble message_app_link deterministically when server doesn't provide one.
+	if runtime != nil && runtime.Config != nil {
+		if rawAppLink, _ := m["message_app_link"].(string); rawAppLink == "" {
+			if assembled := assembleMessageAppLink(m, runtime.Config.Brand); assembled != "" {
+				msg["message_app_link"] = assembled
+			}
+		}
+	}
+
 	if len(mentions) > 0 {
 		simplified := make([]map[string]interface{}, 0, len(mentions))
 		for _, raw := range mentions {
@@ -164,6 +192,81 @@ func FormatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext,
 	}
 
 	return msg
+}
+
+func assembleMessageAppLink(m map[string]interface{}, brand core.LarkBrand) string {
+	domain := resolveAppLinkDomain(brand)
+	if domain == "" {
+		return ""
+	}
+
+	chatID, _ := m["chat_id"].(string)
+	threadID, _ := m["thread_id"].(string)
+	msgPos, okMsgPos := normalizeMessagePosition(m["message_position"])
+	threadPos, okThreadPos := normalizeMessagePosition(m["thread_message_position"])
+
+	// Thread app link requires both thread_id and chat_id.
+	if threadID != "" && chatID != "" && okThreadPos {
+		return fmt.Sprintf("https://%s/client/thread/open?open_thread_id=%s&open_chat_id=%s&thread_position=%s", domain, threadID, chatID, threadPos)
+	}
+	if chatID != "" && okMsgPos {
+		return fmt.Sprintf("https://%s/client/chat/open?openChatId=%s&position=%s", domain, chatID, msgPos)
+	}
+	return ""
+}
+
+func normalizeMessagePosition(v interface{}) (string, bool) {
+	switch vv := v.(type) {
+	case float64:
+		if math.IsNaN(vv) || math.IsInf(vv, 0) {
+			return "", false
+		}
+		if math.Trunc(vv) == vv {
+			return strconv.FormatInt(int64(vv), 10), true
+		}
+		return strconv.FormatFloat(vv, 'f', -1, 64), true
+	case int:
+		return strconv.Itoa(vv), true
+	case int64:
+		return strconv.FormatInt(vv, 10), true
+	case json.Number:
+		s := strings.TrimSpace(vv.String())
+		if s == "" {
+			return "", false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return "", false
+		}
+		if math.Trunc(f) == f {
+			return strconv.FormatInt(int64(f), 10), true
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), true
+	case string:
+		s := strings.TrimSpace(vv)
+		if s == "" {
+			return "", false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return "", false
+		}
+		if math.Trunc(f) == f {
+			return strconv.FormatInt(int64(f), 10), true
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), true
+	default:
+		return "", false
+	}
+}
+
+func resolveAppLinkDomain(brand core.LarkBrand) string {
+	appLink := core.ResolveEndpoints(brand).AppLink
+	u, err := url.Parse(appLink)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // extractMentionOpenId extracts open_id from mention id (string or {"open_id":...} object).

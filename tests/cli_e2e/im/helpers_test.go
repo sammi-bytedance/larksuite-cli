@@ -5,12 +5,60 @@ package im
 
 import (
 	"context"
+	"net/url"
+	"os"
 	"testing"
+	"strings"
 
 	clie2e "github.com/larksuite/cli/tests/cli_e2e"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+func expectedAppLinkDomain() string {
+	brand := strings.ToLower(strings.TrimSpace(os.Getenv("LARKSUITE_CLI_BRAND")))
+	if brand == "lark" || brand == "larksuite" {
+		return "applink.larksuite.com"
+	}
+	// Default to feishu; most test environments use feishu when unset.
+	return "applink.feishu.cn"
+}
+
+func requireChatMessageAppLink(t *testing.T, appLink string, chatID string, messagePosition string) {
+	t.Helper()
+	require.NotEmpty(t, appLink, "message_app_link should not be empty")
+	require.NotEmpty(t, chatID, "chat_id should not be empty")
+	require.NotEmpty(t, messagePosition, "message_position should not be empty")
+
+	u, err := url.Parse(appLink)
+	require.NoError(t, err, "invalid message_app_link: %s", appLink)
+	require.Equal(t, "https", u.Scheme)
+	require.Equal(t, expectedAppLinkDomain(), u.Host)
+	require.Equal(t, "/client/chat/open", u.Path)
+
+	q := u.Query()
+	require.Equal(t, chatID, q.Get("openChatId"))
+	require.Equal(t, messagePosition, q.Get("position"))
+}
+
+func requireThreadMessageAppLink(t *testing.T, appLink string, threadID string, chatID string, threadMessagePosition string) {
+	t.Helper()
+	require.NotEmpty(t, appLink, "message_app_link should not be empty")
+	require.NotEmpty(t, threadID, "thread_id should not be empty")
+	require.NotEmpty(t, chatID, "chat_id should not be empty")
+	require.NotEmpty(t, threadMessagePosition, "thread_message_position should not be empty")
+
+	u, err := url.Parse(appLink)
+	require.NoError(t, err, "invalid message_app_link: %s", appLink)
+	require.Equal(t, "https", u.Scheme)
+	require.Equal(t, expectedAppLinkDomain(), u.Host)
+	require.Equal(t, "/client/thread/open", u.Path)
+
+	q := u.Query()
+	require.Equal(t, threadID, q.Get("open_thread_id"))
+	require.Equal(t, chatID, q.Get("open_chat_id"))
+	require.Equal(t, threadMessagePosition, q.Get("thread_position"))
+}
 
 // createChat creates a private chat with the given name and returns the chatID.
 // The chat will be automatically cleaned up via parentT.Cleanup().

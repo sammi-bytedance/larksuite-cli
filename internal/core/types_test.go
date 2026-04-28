@@ -16,6 +16,9 @@ func TestResolveEndpoints_Feishu(t *testing.T) {
 	if ep.MCP != "https://mcp.feishu.cn" {
 		t.Errorf("MCP = %q, want feishu.cn", ep.MCP)
 	}
+	if ep.AppLink != "https://applink.feishu.cn" {
+		t.Errorf("AppLink = %q, want feishu.cn", ep.AppLink)
+	}
 }
 
 func TestResolveEndpoints_Lark(t *testing.T) {
@@ -28,6 +31,9 @@ func TestResolveEndpoints_Lark(t *testing.T) {
 	}
 	if ep.MCP != "https://mcp.larksuite.com" {
 		t.Errorf("MCP = %q, want larksuite.com", ep.MCP)
+	}
+	if ep.AppLink != "https://applink.larksuite.com" {
+		t.Errorf("AppLink = %q, want larksuite.com", ep.AppLink)
 	}
 }
 

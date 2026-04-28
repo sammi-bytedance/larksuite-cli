@@ -102,6 +102,28 @@ func TestIM_MessageReplyWorkflowAsBot(t *testing.T) {
 		var found bool
 		for _, item := range gjson.Get(threadResult.Stdout, "data.messages").Array() {
 			if strings.Contains(item.Get("content").String(), replyText) {
+				appLink := item.Get("message_app_link").String()
+				chatID := item.Get("chat_id").String()
+				threadMsgPos := item.Get("thread_message_position").String()
+				msgPos := item.Get("message_position").String()
+				if appLink == "" {
+					t.Fatalf("thread message_app_link is empty; chat_id=%q thread_id=%q thread_message_position=%q message_position=%q item=%s\nstdout:\n%s",
+						chatID,
+						item.Get("thread_id").String(),
+						threadMsgPos,
+						msgPos,
+						item.Raw,
+						threadResult.Stdout,
+					)
+				}
+				requireThreadMessageAppLink(
+					t,
+					appLink,
+					threadID,
+					chatID,
+					threadMsgPos,
+				)
+				require.Equal(t, threadID, item.Get("thread_id").String(), "stdout:\n%s", threadResult.Stdout)
 				found = true
 				break
 			}
