@@ -427,15 +427,14 @@ func TestBuildPostElements(t *testing.T) {
 			wantSubs: []string{`"tag":"md"`, `click here: `, `"tag":"a"`, `https://example.com/path`, ` ok?`},
 		},
 		{
-			name:     "markdown link kept in md segment",
+			name:     "markdown link becomes a tag",
 			input:    "[click here](https://example.com/path_with_underscore)",
-			wantSubs: []string{`"tag":"md"`, `[click here](https://example.com/path_with_underscore)`},
+			wantSubs: []string{`"tag":"a"`, `"text":"click here"`, `"href":"https://example.com/path_with_underscore"`},
 		},
 		{
-			name:      "markdown link not promoted to a tag",
-			input:     "[text](https://example.com)",
-			wantSubs:  []string{`"tag":"md"`},
-			wantNsubs: []string{`"tag":"a"`},
+			name:     "markdown link basic",
+			input:    "[text](https://example.com)",
+			wantSubs: []string{`"tag":"a"`, `"text":"text"`, `"href":"https://example.com"`},
 		},
 		{
 			name:  "multiple bare URLs",
@@ -449,7 +448,13 @@ func TestBuildPostElements(t *testing.T) {
 		{
 			name:     "mixed markdown and bare URL",
 			input:    "**bold** https://example.com/foo_bar [link](https://example.com) end",
-			wantSubs: []string{`"tag":"md"`, `**bold**`, `"tag":"a"`, `foo_bar`, `[link](https://example.com)`},
+			wantSubs: []string{`"tag":"md"`, `**bold**`, `"tag":"a"`, `foo_bar`, `"text":"link"`, `"href":"https://example.com"`},
+		},
+		{
+			name:      "inline code span keeps markdown link literal",
+			input:     "`[text](https://example.com)`",
+			wantSubs:  []string{`"tag":"md"`, "`[text](https://example.com)`"},
+			wantNsubs: []string{`"tag":"a"`},
 		},
 		{
 			name:     "empty string",
@@ -526,6 +531,30 @@ func TestWrapMarkdownAsPost(t *testing.T) {
 		}
 		if !strings.Contains(got, `flow_id=abc_def`) {
 			t.Fatalf("wrapMarkdownAsPost() URL content missing: %s", got)
+		}
+	})
+
+	t.Run("markdown link becomes a tag", func(t *testing.T) {
+		got := wrapMarkdownAsPost("[测试一下](https://www.baidu.com)")
+		if !strings.Contains(got, `"tag":"a"`) {
+			t.Fatalf("wrapMarkdownAsPost() markdown link should produce a tag: %s", got)
+		}
+		if !strings.Contains(got, `"text":"测试一下"`) {
+			t.Fatalf("wrapMarkdownAsPost() link text missing: %s", got)
+		}
+		if !strings.Contains(got, `"href":"https://www.baidu.com"`) {
+			t.Fatalf("wrapMarkdownAsPost() link href missing: %s", got)
+		}
+	})
+
+	t.Run("inline code span keeps markdown link literal", func(t *testing.T) {
+		got := wrapMarkdownAsPost("`[测试一下](https://www.baidu.com)`")
+		// Should not promote to a tag because it's inside inline code.
+		if strings.Contains(got, `"tag":"a"`) {
+			t.Fatalf("wrapMarkdownAsPost() inline code span should not promote links: %s", got)
+		}
+		if !strings.Contains(got, "`[测试一下](https://www.baidu.com)`") {
+			t.Fatalf("wrapMarkdownAsPost() inline code literal missing: %s", got)
 		}
 	})
 

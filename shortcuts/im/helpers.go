@@ -789,6 +789,7 @@ var (
 
 const (
 	markdownCodeBlockPlaceholder = "___CB_"
+	markdownCodeSpanPlaceholder  = "___CS_"
 	postBlankLinePlaceholder     = "\u200B"
 )
 
@@ -814,6 +815,83 @@ func restoreMarkdownCodeBlocks(text string, codeBlocks []string) string {
 		restored = strings.Replace(restored, fmt.Sprintf("%s%d___", markdownCodeBlockPlaceholder, i), block, 1)
 	}
 	return restored
+}
+
+// protectMarkdownCodeSpans extracts inline code spans delimited by backticks (`...`),
+// replacing them with placeholders. It supports variable-length backtick fences
+// (e.g. ``code`with`ticks``) by matching the same-length closing fence.
+//
+// Note: This is intentionally best-effort and is only used to prevent the IM post
+// tokenizer from splitting markdown tokens inside code spans.
+func protectMarkdownCodeSpans(text string) (string, []string) {
+	if !strings.Contains(text, "`") {
+		return text, nil
+	}
+
+	var spans []string
+	out := make([]byte, 0, len(text))
+	for i := 0; i < len(text); {
+		if text[i] != '`' {
+			out = append(out, text[i])
+			i++
+			continue
+		}
+
+		// Count opening backticks.
+		j := i
+		for j < len(text) && text[j] == '`' {
+			j++
+		}
+		fenceLen := j - i
+		if fenceLen <= 0 {
+			out = append(out, text[i])
+			i++
+			continue
+		}
+
+		// Find the matching closing fence of the same length.
+		close := -1
+		for k := j; k < len(text); k++ {
+			if text[k] != '`' {
+				continue
+			}
+			m := k
+			for m < len(text) && text[m] == '`' {
+				m++
+			}
+			if m-k == fenceLen {
+				close = k
+				break
+			}
+			k = m - 1
+		}
+		if close < 0 {
+			// No closing fence; treat as literal.
+			out = append(out, text[i])
+			i++
+			continue
+		}
+
+		span := text[i : close+fenceLen]
+		idx := len(spans)
+		spans = append(spans, span)
+		out = append(out, []byte(fmt.Sprintf("%s%d___", markdownCodeSpanPlaceholder, idx))...)
+		i = close + fenceLen
+	}
+	return string(out), spans
+}
+
+func restoreMarkdownCodeSpans(text string, codeSpans []string) string {
+	restored := text
+	for i, span := range codeSpans {
+		restored = strings.Replace(restored, fmt.Sprintf("%s%d___", markdownCodeSpanPlaceholder, i), span, 1)
+	}
+	return restored
+}
+
+func restoreMarkdownProtected(text string, codeSpans, codeBlocks []string) string {
+	// Reverse the protection order: blocks -> spans, so restore spans first.
+	return restoreMarkdownCodeBlocks(restoreMarkdownCodeSpans(text, codeSpans), codeBlocks)
 }
 
 func optimizeMarkdownStyle(text string) string {
@@ -942,15 +1020,20 @@ func buildMarkdownPostContent(markdown string) string {
 }
 
 // buildPostElementNodes splits optimized markdown text into Feishu post inline
-// elements. It tokenizes markdown links/images and bare http(s) URLs:
-//   - markdown links are kept verbatim inside a {"tag":"md"} segment
-//   - bare URLs become {"tag":"a"} elements rendered natively by Feishu,
-//     avoiding the md renderer misinterpreting underscores as italic markers
+// elements.
 //
-// Fenced code blocks are protected before tokenization so their content remains
-// a single md segment, and bare URLs support balanced parentheses in the path.
+// Behavior:
+//   - markdown links [text](url) are converted into native {"tag":"a"} elements
+//     so clients render them as clickable links.
+//   - markdown images ![alt](img_xxx) remain in a {"tag":"md"} segment.
+//   - bare URLs become {"tag":"a"} elements rendered natively by Feishu,
+//     avoiding the md renderer misinterpreting underscores as italic markers.
+//
+// Fenced code blocks and inline code spans are protected before tokenization so
+// their content stays in a single md segment.
 func buildPostElementNodes(text string) []map[string]interface{} {
 	protected, codeBlocks := protectMarkdownCodeBlocks(text)
+	protected, codeSpans := protectMarkdownCodeSpans(protected)
 	if protected == "" {
 		return []map[string]interface{}{{
 			"tag":  "md",
@@ -966,12 +1049,20 @@ func buildPostElementNodes(text string) []map[string]interface{} {
 			continue
 		}
 		if i > prev {
-			elems = appendMDPostNode(elems, restoreMarkdownCodeBlocks(protected[prev:i], codeBlocks))
+			elems = appendMDPostNode(elems, restoreMarkdownProtected(protected[prev:i], codeSpans, codeBlocks))
 		}
 
 		token := protected[i:end]
 		if kind == postTokenMarkdown {
-			elems = appendMDPostNode(elems, restoreMarkdownCodeBlocks(token, codeBlocks))
+			if isImage, linkText, href, ok := parseMarkdownLinkToken(token); ok && !isImage {
+				elems = append(elems, map[string]interface{}{
+					"tag":  "a",
+					"text": restoreMarkdownProtected(linkText, codeSpans, codeBlocks),
+					"href": restoreMarkdownProtected(href, codeSpans, codeBlocks),
+				})
+			} else {
+				elems = appendMDPostNode(elems, restoreMarkdownProtected(token, codeSpans, codeBlocks))
+			}
 		} else {
 			url := trimBareURLToken(token)
 			if url == "" {
@@ -982,13 +1073,13 @@ func buildPostElementNodes(text string) []map[string]interface{} {
 				"text": url,
 				"href": url,
 			})
-			elems = appendMDPostNode(elems, restoreMarkdownCodeBlocks(token[len(url):], codeBlocks))
+			elems = appendMDPostNode(elems, restoreMarkdownProtected(token[len(url):], codeSpans, codeBlocks))
 		}
 		prev = end
 		i = end
 	}
 	if prev < len(protected) {
-		elems = appendMDPostNode(elems, restoreMarkdownCodeBlocks(protected[prev:], codeBlocks))
+		elems = appendMDPostNode(elems, restoreMarkdownProtected(protected[prev:], codeSpans, codeBlocks))
 	}
 	if len(elems) == 0 {
 		return []map[string]interface{}{{
@@ -997,6 +1088,49 @@ func buildPostElementNodes(text string) []map[string]interface{} {
 		}}
 	}
 	return elems
+}
+
+func parseMarkdownLinkToken(token string) (isImage bool, text, href string, ok bool) {
+	if token == "" {
+		return false, "", "", false
+	}
+	start := 0
+	if token[0] == '!' {
+		isImage = true
+		start = 1
+		if start >= len(token) || token[start] != '[' {
+			return false, "", "", false
+		}
+	} else if token[0] != '[' {
+		return false, "", "", false
+	}
+
+	closeBracket := strings.IndexByte(token[start+1:], ']')
+	if closeBracket < 0 {
+		return false, "", "", false
+	}
+	closeBracket += start + 1
+	if closeBracket+1 >= len(token) || token[closeBracket+1] != '(' {
+		return false, "", "", false
+	}
+	if !strings.HasSuffix(token, ")") {
+		return false, "", "", false
+	}
+
+	text = token[start+1 : closeBracket]
+	href = strings.TrimSpace(token[closeBracket+2 : len(token)-1])
+	if href == "" {
+		return false, "", "", false
+	}
+	// Drop optional title portion: (url "title"). Keep only URL part.
+	if idx := strings.IndexAny(href, " \t\n\r"); idx >= 0 {
+		href = strings.TrimSpace(href[:idx])
+	}
+	href = strings.Trim(href, "<>")
+	if href == "" {
+		return false, "", "", false
+	}
+	return isImage, text, href, true
 }
 
 func trimBareURLToken(token string) string {
