@@ -4,9 +4,15 @@
 package convertlib
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
+	"net/url"
+	"reflect"
+	"strconv"
 	"strings"
 
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/shortcuts/common"
 )
 
@@ -148,6 +154,27 @@ func FormatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext,
 		msg["reply_to"] = pid
 	}
 
+	// Preserve API-provided fields (even if this formatter doesn't otherwise use them).
+	if v, ok := m["chat_id"]; ok {
+		msg["chat_id"] = v
+	}
+	if v, ok := m["message_position"]; ok {
+		msg["message_position"] = v
+	}
+	if v, ok := m["thread_message_position"]; ok {
+		msg["thread_message_position"] = v
+	}
+
+	// Prefer API-provided message_app_link when it's a non-empty string; otherwise assemble deterministically.
+	appLink, _ := m["message_app_link"].(string)
+	appLink = strings.TrimSpace(appLink)
+	if appLink == "" && runtime != nil && runtime.Config != nil {
+		appLink = assembleMessageAppLink(m, runtime.Config.Brand)
+	}
+	if appLink != "" {
+		msg["message_app_link"] = appLink
+	}
+
 	if len(mentions) > 0 {
 		simplified := make([]map[string]interface{}, 0, len(mentions))
 		for _, raw := range mentions {
@@ -164,6 +191,150 @@ func FormatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext,
 	}
 
 	return msg
+}
+
+func assembleMessageAppLink(m map[string]interface{}, brand core.LarkBrand) string {
+	domain := resolveAppLinkDomain(brand)
+	if domain == "" {
+		return ""
+	}
+
+	chatID, _ := m["chat_id"].(string)
+	threadID, _ := m["thread_id"].(string)
+	msgPos, okMsgPos := normalizeMessagePosition(m["message_position"])
+	threadPos, okThreadPos := normalizeMessagePosition(m["thread_message_position"])
+
+	// Thread app link requires both thread_id and chat_id.
+	// Emit both underscore-less (openthreadid/openchatid) and snake_case (open_thread_id/open_chat_id)
+	// query keys so PC and mobile clients can both resolve the link.
+	if threadID != "" && chatID != "" && okThreadPos {
+		u := &url.URL{Scheme: "https", Host: domain, Path: "/client/thread/open"}
+		q := url.Values{}
+		q.Set("openthreadid", threadID)
+		q.Set("openchatid", chatID)
+		q.Set("open_thread_id", threadID)
+		q.Set("open_chat_id", chatID)
+		q.Set("thread_position", threadPos)
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+	if chatID != "" && okMsgPos {
+		u := &url.URL{Scheme: "https", Host: domain, Path: "/client/chat/open"}
+		q := url.Values{}
+		q.Set("openChatId", chatID)
+		q.Set("position", msgPos)
+		u.RawQuery = q.Encode()
+		return u.String()
+	}
+	return ""
+}
+
+func normalizeMessagePosition(v interface{}) (string, bool) {
+	if v == nil {
+		return "", false
+	}
+	switch vv := v.(type) {
+	case float32:
+		f := float64(vv)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return "", false
+		}
+		if math.Trunc(f) == f {
+			return strconv.FormatInt(int64(f), 10), true
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), true
+	case float64:
+		if math.IsNaN(vv) || math.IsInf(vv, 0) {
+			return "", false
+		}
+		if math.Trunc(vv) == vv {
+			return strconv.FormatInt(int64(vv), 10), true
+		}
+		return strconv.FormatFloat(vv, 'f', -1, 64), true
+	case int:
+		return strconv.Itoa(vv), true
+	case int8:
+		return strconv.FormatInt(int64(vv), 10), true
+	case int16:
+		return strconv.FormatInt(int64(vv), 10), true
+	case int32:
+		return strconv.FormatInt(int64(vv), 10), true
+	case int64:
+		return strconv.FormatInt(vv, 10), true
+	case uint:
+		return strconv.FormatUint(uint64(vv), 10), true
+	case uint8:
+		return strconv.FormatUint(uint64(vv), 10), true
+	case uint16:
+		return strconv.FormatUint(uint64(vv), 10), true
+	case uint32:
+		return strconv.FormatUint(uint64(vv), 10), true
+	case uint64:
+		return strconv.FormatUint(vv, 10), true
+	case uintptr:
+		return strconv.FormatUint(uint64(vv), 10), true
+	case json.Number:
+		s := strings.TrimSpace(vv.String())
+		if s == "" {
+			return "", false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return "", false
+		}
+		if math.Trunc(f) == f {
+			return strconv.FormatInt(int64(f), 10), true
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), true
+	case string:
+		s := strings.TrimSpace(vv)
+		if s == "" {
+			return "", false
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return "", false
+		}
+		if math.Trunc(f) == f {
+			return strconv.FormatInt(int64(f), 10), true
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), true
+	default:
+		// Fallback for typed numeric values (e.g. int32/uint64 via struct -> interface{}), pointers, etc.
+		rv := reflect.ValueOf(v)
+		for rv.Kind() == reflect.Ptr {
+			if rv.IsNil() {
+				return "", false
+			}
+			rv = rv.Elem()
+		}
+		switch rv.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return strconv.FormatInt(rv.Int(), 10), true
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			return strconv.FormatUint(rv.Uint(), 10), true
+		case reflect.Float32, reflect.Float64:
+			f := rv.Float()
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				return "", false
+			}
+			if math.Trunc(f) == f {
+				return strconv.FormatInt(int64(f), 10), true
+			}
+			return strconv.FormatFloat(f, 'f', -1, 64), true
+		default:
+			return "", false
+		}
+	}
+}
+
+func resolveAppLinkDomain(brand core.LarkBrand) string {
+	appLink := core.ResolveEndpoints(brand).AppLink
+	u, err := url.Parse(appLink)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // extractMentionOpenId extracts open_id from mention id (string or {"open_id":...} object).

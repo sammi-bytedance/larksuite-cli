@@ -4,10 +4,43 @@
 package convertlib
 
 import (
+	"encoding/json"
+	"math"
+	"net/url"
 	"testing"
 
+	"github.com/larksuite/cli/internal/core"
 	"github.com/larksuite/cli/shortcuts/common"
 )
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("url.Parse(%q) error: %v", raw, err)
+	}
+	return u
+}
+
+func assertURLHasQuery(t *testing.T, raw, host, path string, want map[string]string) {
+	t.Helper()
+	u := mustParseURL(t, raw)
+	if u.Scheme != "https" {
+		t.Fatalf("url scheme = %q, want https (%q)", u.Scheme, raw)
+	}
+	if u.Host != host {
+		t.Fatalf("url host = %q, want %q (%q)", u.Host, host, raw)
+	}
+	if u.Path != path {
+		t.Fatalf("url path = %q, want %q (%q)", u.Path, path, raw)
+	}
+	q := u.Query()
+	for k, v := range want {
+		if got := q.Get(k); got != v {
+			t.Fatalf("query[%q] = %q, want %q (%q)", k, got, v, raw)
+		}
+	}
+}
 
 func TestConvertBodyContent(t *testing.T) {
 	ctx := &ConvertContext{RawContent: `{"text":"hello"}`}
@@ -59,6 +92,300 @@ func TestFormatMessageItem(t *testing.T) {
 	mentions, _ := got["mentions"].([]map[string]interface{})
 	if len(mentions) != 1 || mentions[0]["id"] != "ou_alice" {
 		t.Fatalf("FormatMessageItem() mentions = %#v", got["mentions"])
+	}
+}
+
+func TestResolveAppLinkDomain(t *testing.T) {
+	if got := resolveAppLinkDomain(core.BrandFeishu); got != "applink.feishu.cn" {
+		t.Fatalf("resolveAppLinkDomain(feishu) = %q", got)
+	}
+	if got := resolveAppLinkDomain(core.BrandLark); got != "applink.larksuite.com" {
+		t.Fatalf("resolveAppLinkDomain(lark) = %q", got)
+	}
+	if got := resolveAppLinkDomain(core.LarkBrand("other")); got != "applink.feishu.cn" {
+		t.Fatalf("resolveAppLinkDomain(other) = %q, want feishu", got)
+	}
+}
+
+func TestFormatMessageItem_MessageAppLink_PassThrough(t *testing.T) {
+	runtime := &common.RuntimeContext{Config: &core.CliConfig{Brand: core.BrandFeishu}}
+	raw := map[string]interface{}{
+		"msg_type":         "text",
+		"message_id":       "om_123",
+		"create_time":      "1710500000",
+		"chat_id":          "oc_1",
+		"message_position": 12,
+		"message_app_link": "https://applink.feishu.cn/client/chat/open?openChatId=oc_1&position=12",
+		"body":             map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, runtime)
+	if got["message_app_link"] != raw["message_app_link"] {
+		t.Fatalf("FormatMessageItem() message_app_link = %#v, want pass-through", got["message_app_link"])
+	}
+}
+
+func TestFormatMessageItem_MessageAppLink_AssembleChat(t *testing.T) {
+	runtime := &common.RuntimeContext{Config: &core.CliConfig{Brand: core.BrandFeishu}}
+	raw := map[string]interface{}{
+		"msg_type":         "text",
+		"message_id":       "om_123",
+		"create_time":      "1710500000",
+		"chat_id":          "oc_1",
+		"message_position": float64(12),
+		"body":             map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, runtime)
+	assertURLHasQuery(t, got["message_app_link"].(string), "applink.feishu.cn", "/client/chat/open", map[string]string{
+		"openChatId": "oc_1",
+		"position":   "12",
+	})
+}
+
+func TestFormatMessageItem_MessageAppLink_AssembleThread(t *testing.T) {
+	runtime := &common.RuntimeContext{Config: &core.CliConfig{Brand: core.BrandLark}}
+	raw := map[string]interface{}{
+		"msg_type":                "text",
+		"message_id":              "om_123",
+		"create_time":             "1710500000",
+		"chat_id":                 "oc_1",
+		"thread_id":               "omt_1",
+		"thread_message_position": "9",
+		"message_position":        12,
+		"body":                    map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, runtime)
+	assertURLHasQuery(t, got["message_app_link"].(string), "applink.larksuite.com", "/client/thread/open", map[string]string{
+		"openthreadid":    "omt_1",
+		"openchatid":      "oc_1",
+		"open_thread_id":  "omt_1",
+		"open_chat_id":    "oc_1",
+		"thread_position": "9",
+	})
+}
+
+func TestFormatMessageItem_MessageAppLink_FallbackToChatWhenThreadPositionInvalid(t *testing.T) {
+	runtime := &common.RuntimeContext{Config: &core.CliConfig{Brand: core.BrandFeishu}}
+	raw := map[string]interface{}{
+		"msg_type":                "text",
+		"message_id":              "om_123",
+		"create_time":             "1710500000",
+		"chat_id":                 "oc_1",
+		"thread_id":               "omt_1",
+		"thread_message_position": "bad",
+		"message_position":        "12",
+		"body":                    map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, runtime)
+	assertURLHasQuery(t, got["message_app_link"].(string), "applink.feishu.cn", "/client/chat/open", map[string]string{
+		"openChatId": "oc_1",
+		"position":   "12",
+	})
+}
+
+func TestFormatMessageItem_MessageAppLink_BrandUnknownDefaultsToFeishu(t *testing.T) {
+	runtime := &common.RuntimeContext{Config: &core.CliConfig{Brand: core.LarkBrand("other")}}
+	raw := map[string]interface{}{
+		"msg_type":         "text",
+		"message_id":       "om_123",
+		"create_time":      "1710500000",
+		"chat_id":          "oc_1",
+		"message_position": 12,
+		"body":             map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, runtime)
+	assertURLHasQuery(t, got["message_app_link"].(string), "applink.feishu.cn", "/client/chat/open", map[string]string{
+		"openChatId": "oc_1",
+		"position":   "12",
+	})
+}
+
+func TestNormalizeMessagePosition_TypedIntsAndUints(t *testing.T) {
+	if got, ok := normalizeMessagePosition(int32(-3)); !ok || got != "-3" {
+		t.Fatalf("normalizeMessagePosition(int32(-3)) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(uint64(9)); !ok || got != "9" {
+		t.Fatalf("normalizeMessagePosition(uint64(9)) = (%q,%v)", got, ok)
+	}
+}
+
+func TestNormalizeMessagePosition_CoversMoreNumericTypesAndInvalidInputs(t *testing.T) {
+	// ints
+	if got, ok := normalizeMessagePosition(int8(-1)); !ok || got != "-1" {
+		t.Fatalf("normalizeMessagePosition(int8(-1)) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(int16(2)); !ok || got != "2" {
+		t.Fatalf("normalizeMessagePosition(int16(2)) = (%q,%v)", got, ok)
+	}
+
+	// uints
+	if got, ok := normalizeMessagePosition(uint(3)); !ok || got != "3" {
+		t.Fatalf("normalizeMessagePosition(uint(3)) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(uintptr(4)); !ok || got != "4" {
+		t.Fatalf("normalizeMessagePosition(uintptr(4)) = (%q,%v)", got, ok)
+	}
+
+	// float32
+	if got, ok := normalizeMessagePosition(float32(1)); !ok || got != "1" {
+		t.Fatalf("normalizeMessagePosition(float32(1)) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(float64(1.5)); !ok || got != "1.5" {
+		t.Fatalf("normalizeMessagePosition(float64(1.5)) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(float64(-1.5)); !ok || got != "-1.5" {
+		t.Fatalf("normalizeMessagePosition(float64(-1.5)) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(float32(math.NaN())); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(float32(NaN)) = (%q,%v), want ('',false)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(float32(math.Inf(1))); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(float32(+Inf)) = (%q,%v), want ('',false)", got, ok)
+	}
+
+	// json.Number invalid
+	if got, ok := normalizeMessagePosition(json.Number("1.5")); !ok || got != "1.5" {
+		t.Fatalf("normalizeMessagePosition(json.Number(1.5)) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(json.Number("bad")); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(json.Number(bad)) = (%q,%v), want ('',false)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(json.Number("1e309")); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(json.Number(1e309)) = (%q,%v), want ('',false)", got, ok)
+	}
+
+	// string invalid
+	if got, ok := normalizeMessagePosition(" 1.5 "); !ok || got != "1.5" {
+		t.Fatalf("normalizeMessagePosition(\" 1.5 \") = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition("   "); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(blank) = (%q,%v), want ('',false)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition("not-a-number"); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(not-a-number) = (%q,%v), want ('',false)", got, ok)
+	}
+
+	// reflect fallback: pointers
+	i := int32(7)
+	if got, ok := normalizeMessagePosition(&i); !ok || got != "7" {
+		t.Fatalf("normalizeMessagePosition(*int32(7)) = (%q,%v)", got, ok)
+	}
+	u := uint64(8)
+	if got, ok := normalizeMessagePosition(&u); !ok || got != "8" {
+		t.Fatalf("normalizeMessagePosition(*uint64(8)) = (%q,%v)", got, ok)
+	}
+	f := float64(2.25)
+	if got, ok := normalizeMessagePosition(&f); !ok || got != "2.25" {
+		t.Fatalf("normalizeMessagePosition(*float64(2.25)) = (%q,%v)", got, ok)
+	}
+	fNaN := float64(math.NaN())
+	if got, ok := normalizeMessagePosition(&fNaN); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(*float64(NaN)) = (%q,%v), want ('',false)", got, ok)
+	}
+	var nilPtr *int
+	if got, ok := normalizeMessagePosition(nilPtr); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(nil ptr) = (%q,%v), want ('',false)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(struct{}{}); ok || got != "" {
+		t.Fatalf("normalizeMessagePosition(struct{}) = (%q,%v), want ('',false)", got, ok)
+	}
+}
+
+func TestAssembleMessageAppLink_EncodesQueryValues(t *testing.T) {
+	// chat link encoding
+	chat := map[string]interface{}{
+		"chat_id":          "oc_1+2/3",
+		"message_position": 12,
+	}
+	gotChat := assembleMessageAppLink(chat, core.BrandFeishu)
+	assertURLHasQuery(t, gotChat, "applink.feishu.cn", "/client/chat/open", map[string]string{
+		"openChatId": "oc_1+2/3",
+		"position":   "12",
+	})
+
+	// thread link encoding
+	thread := map[string]interface{}{
+		"chat_id":                 "oc_1+2/3",
+		"thread_id":               "omt_1+2/3",
+		"thread_message_position": -1,
+	}
+	gotThread := assembleMessageAppLink(thread, core.BrandFeishu)
+	assertURLHasQuery(t, gotThread, "applink.feishu.cn", "/client/thread/open", map[string]string{
+		"open_thread_id":  "omt_1+2/3",
+		"open_chat_id":    "oc_1+2/3",
+		"openthreadid":    "omt_1+2/3",
+		"openchatid":      "oc_1+2/3",
+		"thread_position": "-1",
+	})
+}
+
+func TestFormatMessageItem_MessageAppLink_NonStringDoesNotLeakNull(t *testing.T) {
+	runtime := &common.RuntimeContext{Config: &core.CliConfig{Brand: core.BrandFeishu}}
+	raw := map[string]interface{}{
+		"msg_type":         "text",
+		"message_id":       "om_123",
+		"create_time":      "1710500000",
+		"chat_id":          "oc_1",
+		"message_position": 12,
+		"message_app_link": nil,
+		"body":             map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, runtime)
+	// Should assemble instead of emitting JSON null.
+	assertURLHasQuery(t, got["message_app_link"].(string), "applink.feishu.cn", "/client/chat/open", map[string]string{
+		"openChatId": "oc_1",
+		"position":   "12",
+	})
+}
+
+func TestFormatMessageItem_MessageAppLink_RuntimeNilNoAssemble(t *testing.T) {
+	raw := map[string]interface{}{
+		"msg_type":         "text",
+		"message_id":       "om_123",
+		"create_time":      "1710500000",
+		"chat_id":          "oc_1",
+		"message_position": 12,
+		"body":             map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, nil)
+	if _, ok := got["message_app_link"]; ok {
+		t.Fatalf("FormatMessageItem() should not assemble without runtime, got %#v", got["message_app_link"])
+	}
+}
+
+func TestFormatMessageItem_MessageAppLink_MissingFieldsNoPanic(t *testing.T) {
+	runtime := &common.RuntimeContext{Config: &core.CliConfig{Brand: core.BrandFeishu}}
+	raw := map[string]interface{}{
+		"msg_type":    "text",
+		"message_id":  "om_123",
+		"create_time": "1710500000",
+		"body":        map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, runtime)
+	if _, ok := got["message_app_link"]; ok {
+		t.Fatalf("FormatMessageItem() message_app_link should be absent when fields are missing, got %#v", got["message_app_link"])
+	}
+}
+
+func TestNormalizeMessagePosition_AllowsZeroAndNegative(t *testing.T) {
+	if got, ok := normalizeMessagePosition("0"); !ok || got != "0" {
+		t.Fatalf("normalizeMessagePosition(\"0\") = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition("-3"); !ok || got != "-3" {
+		t.Fatalf("normalizeMessagePosition(\"-3\") = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(float64(0)); !ok || got != "0" {
+		t.Fatalf("normalizeMessagePosition(0.0) = (%q,%v)", got, ok)
+	}
+	if got, ok := normalizeMessagePosition(float64(-1)); !ok || got != "-1" {
+		t.Fatalf("normalizeMessagePosition(-1.0) = (%q,%v)", got, ok)
 	}
 }
 
