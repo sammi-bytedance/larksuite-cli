@@ -1,6 +1,8 @@
 # im +messages-mget
 
 > **Prerequisite:** Read [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) first to understand authentication, global parameters, and safety rules.
+>
+> **Additional info on messages** (reactions / in-pins flag / read receipts) is **not** auto-attached. See [`../SKILL.md#message-additional-information`](../SKILL.md#message-additional-information) for what to fetch when your task needs it.
 
 Fetch message details in batch. Given a list of message IDs, this returns the full content for multiple messages in one call and automatically resolves sender names.
 

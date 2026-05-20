@@ -62,6 +62,29 @@ Item types for feed-layer flags:
 - **ItemTypeThread** (4) = thread in a topic-style chat
 - **ItemTypeMsgThread** (11) = thread in a regular chat
 
+## Message Additional Information
+
+The basic read APIs (`+messages-mget` / `+chat-messages-list` / `+messages-search` / `+threads-messages-list`) return only the message body. Several pieces of "additional information" that the client UI surfaces (reactions, pin status, read status, etc.) are exposed as separate APIs and need to be fetched separately when the agent's task calls for them.
+
+| Additional info | What it is | How to fetch | When to consider fetching |
+|---|---|---|---|
+| **Reactions** | Who reacted with which emoji on a message | `lark-cli im reactions batch_query --data '{"queries":[{"message_id":"om_a"}]}'` (batch up to 50) — see [`lark-im-reactions.md`](references/lark-im-reactions.md) | Judging whether the user/agent has already responded; avoiding duplicate emoji posts |
+| **In-pins flag** | Whether the message is in the chat's shared Pin list (group-level "已 Pin 消息") | `lark-cli im pins list --params '{"container_id":"oc_xxx"}'`, then set-compare `items[].message_id` against the fetched messages | Recognizing group conventions / announcement-like pinned messages |
+| **Read receipts** | Who has read the message | `lark-cli im messages read_users --params '{"message_id":"om_a"}' --as bot` (bot only + only bot's own messages + within 7 days) | Measuring bot notification reach |
+
+### Naming pitfall — Pin vs Top Notice
+
+Feishu has two unrelated "pinned" concepts:
+
+- **Pin** (`/im/v1/pins`) — the chat-level shared Pin list. This is what the "In-pins flag" above queries.
+- **Top Notice** (`top_notice`) — the yellow banner at the top of a chat. Feishu OpenAPI only exposes PUT/DELETE for `top_notice`; **there is no GET API**, so neither the CLI nor the agent can read the banner content.
+
+When the user says "群里置顶了 XXX" they usually mean the top banner, but only the Pin list is readable.
+
+### Contract: missing additional info ≠ "no data"
+
+If a fetch call fails (timeout / 5xx / scope insufficient / identity mismatch), do **NOT** infer "no reactions" / "not pinned" / "no readers". Treat as **unknown** and either retry, narrow the query, or surface the gap to the user.
+
 ## Shortcuts（推荐优先使用）
 
 Shortcut 是对常用操作的高级封装（`lark-cli im +<verb> [flags]`）。有 Shortcut 的操作优先使用。

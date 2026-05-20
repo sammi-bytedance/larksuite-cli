@@ -1,6 +1,8 @@
 # im +messages-search
 
 > **Prerequisite:** Read [`../lark-shared/SKILL.md`](../../lark-shared/SKILL.md) first to understand authentication, global parameters, and safety rules.
+>
+> **Additional info on messages** (reactions / in-pins flag / read receipts) is **not** auto-attached. See [`../SKILL.md#message-additional-information`](../SKILL.md#message-additional-information) for what to fetch when your task needs it.
 
 Search Feishu messages across conversations. This shortcut automatically performs a multi-step workflow: search for message IDs, batch fetch message details, then enrich the results with chat context.
 
