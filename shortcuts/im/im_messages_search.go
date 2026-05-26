@@ -49,6 +49,7 @@ var ImMessagesSearch = common.Shortcut{
 		{Name: "page-token", Desc: "page token"},
 		{Name: "page-all", Type: "bool", Desc: "automatically paginate search results"},
 		{Name: "page-limit", Type: "int", Default: "20", Desc: "max search pages when auto-pagination is enabled (default 20, max 40)"},
+		{Name: "no-reactions", Type: "bool", Desc: "skip auto-fetching reactions for each message (default: enrichment enabled)"},
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
 		req, err := buildMessagesSearchRequest(runtime)
@@ -184,6 +185,9 @@ var ImMessagesSearch = common.Shortcut{
 		// Enrich: resolve sender names for outer messages (reuses cache from merge_forward)
 		convertlib.ResolveSenderNames(runtime, enriched, nameCache)
 		convertlib.AttachSenderNames(enriched, nameCache)
+		if !runtime.Bool("no-reactions") {
+			convertlib.EnrichReactions(runtime, enriched)
+		}
 
 		outData := map[string]interface{}{
 			"messages":   enriched,

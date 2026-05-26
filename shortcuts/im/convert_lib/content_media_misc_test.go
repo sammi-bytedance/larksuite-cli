@@ -95,6 +95,40 @@ func TestFormatMessageItem(t *testing.T) {
 	}
 }
 
+func TestFormatMessageItem_UpdateTime_Present(t *testing.T) {
+	raw := map[string]interface{}{
+		"msg_type":    "text",
+		"message_id":  "om_edit",
+		"updated":     true,
+		"create_time": "1710500000",
+		"update_time": "1710600000",
+		"sender":      map[string]interface{}{"id": "ou_sender", "sender_type": "user"},
+		"body":        map[string]interface{}{"content": `{"text":"edited"}`},
+	}
+
+	got := FormatMessageItem(raw, nil)
+	want := common.FormatTime("1710600000")
+	if got["update_time"] != want {
+		t.Fatalf("FormatMessageItem() update_time = %#v, want %#v", got["update_time"], want)
+	}
+}
+
+func TestFormatMessageItem_UpdateTime_Absent(t *testing.T) {
+	raw := map[string]interface{}{
+		"msg_type":    "text",
+		"message_id":  "om_no_edit",
+		"updated":     false,
+		"create_time": "1710500000",
+		"sender":      map[string]interface{}{"id": "ou_sender", "sender_type": "user"},
+		"body":        map[string]interface{}{"content": `{"text":"hi"}`},
+	}
+
+	got := FormatMessageItem(raw, nil)
+	if _, ok := got["update_time"]; ok {
+		t.Fatalf("FormatMessageItem() should not include update_time when absent, got = %#v", got["update_time"])
+	}
+}
+
 func TestResolveAppLinkDomain(t *testing.T) {
 	if got := resolveAppLinkDomain(core.BrandFeishu); got != "applink.feishu.cn" {
 		t.Fatalf("resolveAppLinkDomain(feishu) = %q", got)

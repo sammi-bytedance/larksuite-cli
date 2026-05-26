@@ -155,6 +155,9 @@ func FormatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext,
 	}
 
 	// Preserve API-provided fields (even if this formatter doesn't otherwise use them).
+	if v, ok := m["update_time"]; ok && v != nil && v != "" {
+		msg["update_time"] = common.FormatTime(v)
+	}
 	if v, ok := m["chat_id"]; ok {
 		msg["chat_id"] = v
 	}

@@ -28,6 +28,7 @@ var ImMessagesMGet = common.Shortcut{
 	HasFormat:   true,
 	Flags: []common.Flag{
 		{Name: "message-ids", Desc: "message IDs, comma-separated (om_xxx,om_yyy)", Required: true},
+		{Name: "no-reactions", Type: "bool", Desc: "skip auto-fetching reactions for each message (default: enrichment enabled)"},
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
 		ids := common.SplitCSV(runtime.Str("message-ids"))
@@ -68,6 +69,9 @@ var ImMessagesMGet = common.Shortcut{
 
 		convertlib.ResolveSenderNames(runtime, messages, nameCache)
 		convertlib.AttachSenderNames(messages, nameCache)
+		if !runtime.Bool("no-reactions") {
+			convertlib.EnrichReactions(runtime, messages)
+		}
 		convertlib.ExpandThreadReplies(runtime, messages, nameCache, convertlib.ThreadRepliesPerThread, convertlib.ThreadRepliesTotalLimit)
 
 		outData := map[string]interface{}{

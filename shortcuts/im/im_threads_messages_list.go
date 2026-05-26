@@ -33,6 +33,7 @@ var ImThreadsMessagesList = common.Shortcut{
 		{Name: "sort", Default: "asc", Desc: "sort order", Enum: []string{"asc", "desc"}},
 		{Name: "page-size", Default: "50", Desc: "page size (1-500)"},
 		{Name: "page-token", Desc: "page token"},
+		{Name: "no-reactions", Type: "bool", Desc: "skip auto-fetching reactions for each message (default: enrichment enabled)"},
 	},
 	DryRun: func(ctx context.Context, runtime *common.RuntimeContext) *common.DryRunAPI {
 		threadFlag := runtime.Str("thread")
@@ -124,6 +125,9 @@ var ImThreadsMessagesList = common.Shortcut{
 		// Enrich: resolve sender names for outer messages (reuses cache from merge_forward)
 		convertlib.ResolveSenderNames(runtime, messages, nameCache)
 		convertlib.AttachSenderNames(messages, nameCache)
+		if !runtime.Bool("no-reactions") {
+			convertlib.EnrichReactions(runtime, messages)
+		}
 
 		outData := map[string]interface{}{
 			"thread_id":  threadId,
