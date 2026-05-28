@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -86,6 +87,79 @@ func TestFetchThreadRepliesError(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatalf("fetchThreadReplies() err = nil, want non-nil")
+	}
+}
+
+// TestExpandThreadRepliesMultiThreadConcurrent exercises the bounded-concurrency
+// multi-thread path: every distinct thread_id gets its own GET fetched in
+// parallel, and the right replies land on the right outer host (the *first*
+// outer message that referenced each thread_id). A race or cross-thread
+// result mix-up would manifest as missing / mis-attached replies.
+func TestExpandThreadRepliesMultiThreadConcurrent(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		callCount int
+	)
+	runtime := newBotConvertlibRuntime(t, convertlibRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if !strings.Contains(req.URL.Path, "/open-apis/im/v1/messages") {
+			return nil, fmt.Errorf("unexpected path: %s", req.URL.Path)
+		}
+		tid := req.URL.Query().Get("container_id")
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		// Return one synthetic reply per thread, tagged with the thread id so
+		// we can assert that the right replies landed on the right host.
+		return convertlibJSONResponse(200, map[string]interface{}{
+			"code": 0,
+			"data": map[string]interface{}{
+				"has_more": false,
+				"items": []interface{}{
+					map[string]interface{}{
+						"message_id":  "om_reply_" + tid,
+						"msg_type":    "text",
+						"create_time": "1710500000",
+						"thread_id":   tid,
+						"sender":      map[string]interface{}{"name": "Sender"},
+						"body":        map[string]interface{}{"content": `{"text":"reply for ` + tid + `"}`},
+					},
+				},
+			},
+		}), nil
+	}))
+
+	// 5 distinct thread roots → 5 planned fetches, dispatched under the
+	// concurrency cap. Enough to actually exercise the bounded fan-out
+	// rather than degenerate to the single-thread fast path.
+	messages := []map[string]interface{}{
+		{"message_id": "om_root_1", "thread_id": "omt_a"},
+		{"message_id": "om_root_2", "thread_id": "omt_b"},
+		{"message_id": "om_root_3", "thread_id": "omt_c"},
+		{"message_id": "om_root_4", "thread_id": "omt_d"},
+		{"message_id": "om_root_5", "thread_id": "omt_e"},
+	}
+
+	ExpandThreadReplies(runtime, messages, map[string]string{}, 10, 500)
+
+	if callCount != 5 {
+		t.Fatalf("expected 5 thread fetches, got %d", callCount)
+	}
+	for i, m := range messages {
+		tid := m["thread_id"].(string)
+		replies, ok := m["thread_replies"].([]map[string]interface{})
+		if !ok {
+			t.Fatalf("message %d (thread %s) missing thread_replies: %#v", i, tid, m)
+		}
+		if len(replies) != 1 {
+			t.Fatalf("message %d (thread %s) replies len = %d, want 1", i, tid, len(replies))
+		}
+		// Each thread's reply was tagged with its own thread_id; verify no
+		// goroutine cross-contamination.
+		gotTid, _ := replies[0]["thread_id"].(string)
+		if gotTid != tid {
+			t.Fatalf("message %d (thread %s) got reply tagged with thread_id=%q — cross-thread contamination",
+				i, tid, gotTid)
+		}
 	}
 }
 
