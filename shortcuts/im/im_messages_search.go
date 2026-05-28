@@ -159,13 +159,19 @@ var ImMessagesSearch = common.Shortcut{
 
 		// ── Step 4: Format message content + attach chat context ──
 		nameCache := make(map[string]string)
+		// Pre-fetch merge_forward sub-messages concurrently before the per-item
+		// conversion loop, so N merge_forwards in the search hits don't
+		// serialize into N × ~1s of stall inside FormatMessageItem. Passing
+		// nameCache also pre-resolves every sub-item's sender open_id in one
+		// batched contact API call.
+		mergePrefetch := convertlib.PrefetchMergeForwardSubItems(runtime, msgItems, nameCache)
 		enriched := make([]map[string]interface{}, 0, len(msgItems))
 		for _, item := range msgItems {
 			m, _ := item.(map[string]interface{})
 			chatId, _ := m["chat_id"].(string)
 
 			// Reuse unified content converter
-			msg := convertlib.FormatMessageItem(m, runtime, nameCache)
+			msg := convertlib.FormatMessageItemWithMergePrefetch(m, runtime, nameCache, mergePrefetch)
 			if chatId != "" {
 				msg["chat_id"] = chatId
 			}

@@ -5,7 +5,9 @@ package convertlib
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"sync"
 
 	"github.com/larksuite/cli/shortcuts/common"
 )
@@ -14,6 +16,16 @@ import (
 // length for POST /im/v1/messages/reactions/batch_query (see
 // larkim/message/members/facade_reaction/service: batchListReactionsMaxMessageIDs).
 const reactionsBatchQueryMaxQueries = 20
+
+// reactionsBatchQueryConcurrency caps in-flight batch_query requests. A single
+// batch_query call is observed at ~700ms RTT regardless of payload size, so a
+// fully serial loop turns N=550 (page-size 50 + 500 expanded thread_replies)
+// into ~20s of latency and lets outer wrappers (agents, shells with a wall
+// clock) time the whole command out. Bounded concurrency cuts that to ~5s
+// without risking the server's gateway-layer 50/s + 1000/min ceiling: even at
+// the worst sustained pattern (28 batches at 4-way fan-out finishing every
+// ~700ms) the effective rate stays well under 6/s.
+const reactionsBatchQueryConcurrency = 4
 
 // EnrichReactions enriches messages with their reactions by calling the
 // im.reactions.batch_query API. Messages are modified in place: each message
@@ -57,13 +69,51 @@ func EnrichReactions(runtime *common.RuntimeContext, messages []map[string]inter
 		return
 	}
 
+	// Slice the id list into batches of <= reactionsBatchQueryMaxQueries.
+	var batches [][]string
 	for i := 0; i < len(ids); i += reactionsBatchQueryMaxQueries {
 		end := i + reactionsBatchQueryMaxQueries
 		if end > len(ids) {
 			end = len(ids)
 		}
-		fetchReactionsBatch(runtime, ids[i:end], idIndex)
+		batches = append(batches, ids[i:end])
 	}
+
+	// Single-batch fast path: no goroutine overhead, fully deterministic
+	// stderr ordering, identical behavior to the original serial loop.
+	if len(batches) == 1 {
+		fetchReactionsBatch(runtime, batches[0], idIndex, nil)
+		return
+	}
+
+	// Multi-batch path: bounded-concurrency fan-out. Safety invariant:
+	// collectMessageNodes dedups ids on first-seen (the `if _, seen :=
+	// idIndex[id]; !seen` check above), so the slice ids — and therefore
+	// every batch[i:end] sub-slice we hand to a goroutine — contains each
+	// id at most once. Different batches operate on disjoint id sets,
+	// which means different idIndex buckets, which means different
+	// message-map pointers. Goroutines never write to the same map. The
+	// shared mutex serializes only the stderr warning lines so they don't
+	// interleave between goroutines. (Race detector verifies; see
+	// TestEnrichReactions_DuplicateMessageID and
+	// TestEnrichReactions_MultiBatchCorrectness for the round-trip.)
+	var stderrMu sync.Mutex
+	sem := make(chan struct{}, reactionsBatchQueryConcurrency)
+	var wg sync.WaitGroup
+	for _, batch := range batches {
+		// Add(1) before the semaphore acquire — sync.WaitGroup godoc
+		// recommends Add precede the goroutine-spawning event, and
+		// putting it ahead of the blocking sem read keeps the parent
+		// goroutine's bookkeeping monotonic.
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fetchReactionsBatch(runtime, batch, idIndex, &stderrMu)
+		}()
+	}
+	wg.Wait()
 }
 
 // collectMessageNodes walks messages (and any nested thread_replies) and
@@ -97,7 +147,10 @@ func collectMessageNodes(messages []map[string]interface{}, idIndex map[string][
 // fetchReactionsBatch invokes batch_query for one batch of <= 20 message IDs
 // and merges the results into idIndex. Failures are logged to stderr without
 // aborting subsequent batches.
-func fetchReactionsBatch(runtime *common.RuntimeContext, batchIDs []string, idIndex map[string][]map[string]interface{}) {
+//
+// stderrMu is non-nil in the multi-batch concurrent path (serializes warning
+// lines so they don't interleave) and nil in the single-batch fast path.
+func fetchReactionsBatch(runtime *common.RuntimeContext, batchIDs []string, idIndex map[string][]map[string]interface{}, stderrMu *sync.Mutex) {
 	queries := make([]map[string]interface{}, 0, len(batchIDs))
 	for _, id := range batchIDs {
 		queries = append(queries, map[string]interface{}{"message_id": id})
@@ -109,7 +162,7 @@ func fetchReactionsBatch(runtime *common.RuntimeContext, batchIDs []string, idIn
 		map[string]interface{}{"queries": queries},
 	)
 	if err != nil {
-		fmt.Fprintf(runtime.IO().ErrOut, "warning: reactions_batch_query_failed: %v\n", err)
+		warnReactionsf(stderrMu, runtime.IO().ErrOut, "warning: reactions_batch_query_failed: %v\n", err)
 		markReactionsError(batchIDs, idIndex)
 		return
 	}
@@ -151,12 +204,24 @@ func fetchReactionsBatch(runtime *common.RuntimeContext, batchIDs []string, idIn
 			}
 		}
 		if len(failedIDs) > 0 {
-			fmt.Fprintf(runtime.IO().ErrOut,
+			warnReactionsf(stderrMu, runtime.IO().ErrOut,
 				"warning: reactions_partial_failed: %d message(s) failed (%v)\n",
 				len(failedIDs), failedIDs)
 			markReactionsError(failedIDs, idIndex)
 		}
 	}
+}
+
+// warnReactionsf writes a stderr warning under the supplied mutex when one is
+// provided (multi-batch concurrent path), so concurrent goroutines can't
+// interleave partial lines. mu == nil means the caller is on the single-batch
+// fast path where no synchronization is needed.
+func warnReactionsf(mu *sync.Mutex, w io.Writer, format string, args ...interface{}) {
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+	fmt.Fprintf(w, format, args...)
 }
 
 // markReactionsError flags every message map indexed under the given ids with

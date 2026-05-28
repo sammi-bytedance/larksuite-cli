@@ -117,10 +117,19 @@ var ImChatMessageList = common.Shortcut{
 		hasMore, nextPageToken := common.PaginationMeta(data)
 
 		nameCache := make(map[string]string)
+		// Pre-fetch merge_forward sub-messages concurrently before the per-item
+		// conversion loop. Each merge_forward in the page would otherwise issue
+		// its own serial GET inside FormatMessageItem; N merge_forwards turned
+		// into N × ~1s of stall. Passing nameCache also lets the prefetch
+		// batch-resolve every sub-item's sender open_id in one contact API
+		// call, so the per-merge_forward render path doesn't fan out N more
+		// serial contact requests during the FormatMessageItem loop.
+		mergePrefetch := convertlib.PrefetchMergeForwardSubItems(runtime, rawItems, nameCache)
+
 		messages := make([]map[string]interface{}, 0, len(rawItems))
 		for _, item := range rawItems {
 			m, _ := item.(map[string]interface{})
-			messages = append(messages, convertlib.FormatMessageItem(m, runtime, nameCache))
+			messages = append(messages, convertlib.FormatMessageItemWithMergePrefetch(m, runtime, nameCache, mergePrefetch))
 		}
 
 		// Enrich: resolve sender names for outer messages (reuses cache from merge_forward)

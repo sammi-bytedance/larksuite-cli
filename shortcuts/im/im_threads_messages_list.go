@@ -121,10 +121,17 @@ var ImThreadsMessagesList = common.Shortcut{
 		hasMore, nextPageToken := common.PaginationMeta(data)
 
 		nameCache := make(map[string]string)
+		// Pre-fetch merge_forward sub-messages concurrently before the per-item
+		// conversion loop. Thread replies that are themselves merge_forward
+		// messages would otherwise issue serial GETs inside FormatMessageItem.
+		// Passing nameCache also pre-resolves every sub-item's sender open_id
+		// in one batched contact API call.
+		mergePrefetch := convertlib.PrefetchMergeForwardSubItems(runtime, rawItems, nameCache)
+
 		messages := make([]map[string]interface{}, 0, len(rawItems))
 		for _, item := range rawItems {
 			m, _ := item.(map[string]interface{})
-			messages = append(messages, convertlib.FormatMessageItem(m, runtime, nameCache))
+			messages = append(messages, convertlib.FormatMessageItemWithMergePrefetch(m, runtime, nameCache, mergePrefetch))
 		}
 
 		// Enrich: resolve sender names for outer messages (reuses cache from merge_forward)

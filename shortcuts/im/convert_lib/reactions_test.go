@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -84,15 +85,19 @@ func TestEnrichReactions_Success(t *testing.T) {
 }
 
 // TestEnrichReactions_BatchSize splits queries into batches of 20 (server-side
-// max for batch_query).
+// max for batch_query). Multi-batch dispatch is concurrent (bounded fan-out),
+// so callers must tolerate any ordering of batch arrivals at the transport.
 func TestEnrichReactions_BatchSize(t *testing.T) {
+	var mu sync.Mutex
 	var observedBatchSizes []int
 	runtime := newBotConvertlibRuntime(t, convertlibRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(req.Body)
 		var payload map[string]interface{}
 		_ = json.Unmarshal(body, &payload)
 		queries, _ := payload["queries"].([]interface{})
+		mu.Lock()
 		observedBatchSizes = append(observedBatchSizes, len(queries))
+		mu.Unlock()
 		return convertlibJSONResponse(200, map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{},
@@ -106,8 +111,61 @@ func TestEnrichReactions_BatchSize(t *testing.T) {
 
 	EnrichReactions(runtime, messages)
 
-	if want := []int{20, 5}; !reflect.DeepEqual(observedBatchSizes, want) {
-		t.Fatalf("batch sizes = %v, want %v", observedBatchSizes, want)
+	sort.Ints(observedBatchSizes)
+	if want := []int{5, 20}; !reflect.DeepEqual(observedBatchSizes, want) {
+		t.Fatalf("batch sizes (sorted) = %v, want %v", observedBatchSizes, want)
+	}
+}
+
+// TestEnrichReactions_MultiBatchCorrectness exercises the bounded-concurrency
+// multi-batch path: every message across all batches must receive its own
+// reactions block regardless of which goroutine the batch ran on. A race or a
+// cross-batch index mix-up would manifest as missing or duplicated blocks.
+func TestEnrichReactions_MultiBatchCorrectness(t *testing.T) {
+	var mu sync.Mutex
+	var batchCalls int
+	runtime := newBotConvertlibRuntime(t, convertlibRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		var payload map[string]interface{}
+		_ = json.Unmarshal(body, &payload)
+		queries, _ := payload["queries"].([]interface{})
+		counts := make([]interface{}, 0, len(queries))
+		for _, q := range queries {
+			qm, _ := q.(map[string]interface{})
+			id, _ := qm["message_id"].(string)
+			counts = append(counts, map[string]interface{}{
+				"message_id": id,
+				"reaction_count": []interface{}{
+					map[string]interface{}{"reaction_type": "SMILE", "count": 1},
+				},
+			})
+		}
+		mu.Lock()
+		batchCalls++
+		mu.Unlock()
+		return convertlibJSONResponse(200, map[string]interface{}{
+			"code": 0,
+			"data": map[string]interface{}{
+				"success_msg_reaction_counts": counts,
+			},
+		}), nil
+	}))
+
+	// 65 messages -> 4 batches (20+20+20+5), enough to actually exercise the
+	// bounded fan-out (concurrency cap = 4) rather than degenerate to 1-2 calls.
+	messages := make([]map[string]interface{}, 65)
+	for i := range messages {
+		messages[i] = map[string]interface{}{"message_id": fmt.Sprintf("om_%03d", i)}
+	}
+	EnrichReactions(runtime, messages)
+
+	if batchCalls != 4 {
+		t.Fatalf("expected 4 batched calls, got %d", batchCalls)
+	}
+	for i, m := range messages {
+		if _, ok := m["reactions"]; !ok {
+			t.Fatalf("message %d (%s) missing reactions after multi-batch run", i, m["message_id"])
+		}
 	}
 }
 

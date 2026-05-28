@@ -32,6 +32,14 @@ type ConvertContext struct {
 	// SenderNames is a shared cache of open_id -> display name, accumulated across messages
 	// to avoid redundant contact API calls. May be nil.
 	SenderNames map[string]string
+	// MergeForwardSubItems is an optional pre-fetched cache of merge_forward
+	// sub-message lists, keyed by merge_forward message_id. When set, the
+	// merge_forward converter uses the cached entry instead of issuing its
+	// own GET; populated by callers via PrefetchMergeForwardSubItems before
+	// the FormatMessageItem loop. nil means "no prefetch — fall back to the
+	// per-message inline GET", which keeps non-shortcut callers (events,
+	// ad-hoc tests) working unchanged.
+	MergeForwardSubItems map[string][]map[string]interface{}
 }
 
 // converters maps message types to their ContentConverter implementations.
@@ -119,6 +127,20 @@ func FormatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext,
 	if len(senderNames) > 0 {
 		nameCache = senderNames[0]
 	}
+	return formatMessageItem(m, runtime, nameCache, nil)
+}
+
+// FormatMessageItemWithMergePrefetch is like FormatMessageItem but threads a
+// pre-fetched merge_forward sub-message map (typically built via
+// PrefetchMergeForwardSubItems) through to the merge_forward converter so it
+// can skip its own per-message GET. Shortcuts that iterate a page of raw
+// items should pre-fetch once and call this variant in the loop to avoid the
+// N × ~1s serial-merge_forward stall in the original code path.
+func FormatMessageItemWithMergePrefetch(m map[string]interface{}, runtime *common.RuntimeContext, nameCache map[string]string, mergePrefetch map[string][]map[string]interface{}) map[string]interface{} {
+	return formatMessageItem(m, runtime, nameCache, mergePrefetch)
+}
+
+func formatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext, nameCache map[string]string, mergePrefetch map[string][]map[string]interface{}) map[string]interface{} {
 	msgType, _ := m["msg_type"].(string)
 	messageId, _ := m["message_id"].(string)
 	mentions, _ := m["mentions"].([]interface{})
@@ -129,11 +151,12 @@ func FormatMessageItem(m map[string]interface{}, runtime *common.RuntimeContext,
 	if body, ok := m["body"].(map[string]interface{}); ok {
 		rawContent, _ := body["content"].(string)
 		content = ConvertBodyContent(msgType, &ConvertContext{
-			RawContent:  rawContent,
-			MentionMap:  BuildMentionKeyMap(mentions),
-			MessageID:   messageId,
-			Runtime:     runtime,
-			SenderNames: nameCache,
+			RawContent:           rawContent,
+			MentionMap:           BuildMentionKeyMap(mentions),
+			MessageID:            messageId,
+			Runtime:              runtime,
+			SenderNames:          nameCache,
+			MergeForwardSubItems: mergePrefetch,
 		})
 	}
 

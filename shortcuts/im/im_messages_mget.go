@@ -66,10 +66,17 @@ var ImMessagesMGet = common.Shortcut{
 		rawItems, _ := data["items"].([]interface{})
 
 		nameCache := make(map[string]string)
+		// Pre-fetch merge_forward sub-messages concurrently before the per-item
+		// conversion loop, so N merge_forwards in the input don't serialize
+		// into N × ~1s of stall inside FormatMessageItem. Passing nameCache
+		// also pre-resolves every sub-item's sender open_id in one batched
+		// contact API call.
+		mergePrefetch := convertlib.PrefetchMergeForwardSubItems(runtime, rawItems, nameCache)
+
 		messages := make([]map[string]interface{}, 0, len(rawItems))
 		for _, item := range rawItems {
 			m, _ := item.(map[string]interface{})
-			messages = append(messages, convertlib.FormatMessageItem(m, runtime, nameCache))
+			messages = append(messages, convertlib.FormatMessageItemWithMergePrefetch(m, runtime, nameCache, mergePrefetch))
 		}
 
 		convertlib.ResolveSenderNames(runtime, messages, nameCache)
